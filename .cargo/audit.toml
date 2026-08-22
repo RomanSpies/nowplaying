@@ -1,0 +1,23 @@
+# cargo-audit configuration.
+#
+# Every ignore below is pulled in by librespot 0.8.0 and cannot be fixed from
+# this project (librespot-core pins the versions). Re-check on every librespot
+# upgrade whether these can be dropped.
+
+[advisories]
+ignore = [
+    # quick-xml < 0.41: XML DoS vectors (memory exhaustion / quadratic attr
+    # check). librespot-core pins 0.38; the XML parsed comes from Spotify's
+    # own infrastructure, not from untrusted input.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rsa: Marvin timing sidechannel — no fixed release exists at all.
+    # Used by librespot's legacy auth path.
+    "RUSTSEC-2023-0071",
+    # rustls-webpki 0.102 via rustls 0.22 via hyper-proxy2 (librespot-core).
+    # Only exercised when an HTTP proxy is configured, which we don't do.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]

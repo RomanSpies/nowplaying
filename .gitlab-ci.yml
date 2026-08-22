@@ -1,0 +1,217 @@
+---
+default:
+  tags:
+    - rust
+  before_script:
+    - export PATH="$CARGO_HOME/bin:$HOME/.cargo/bin:$PATH"
+
+variables:
+  # Everything cargo writes lives inside the project dir so it is cacheable.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
+  CARGO_TERM_COLOR: "always"
+  # Incremental compilation buys nothing in CI and bloats the target cache.
+  CARGO_INCREMENTAL: "0"
+  # No debuginfo in CI builds: target/ shrinks by gigabytes, caching stays fast.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # rustc invokes the linker literally as `cc`; the runner only ships a custom
+  # gcc without the cc shim. Point rustc and the cc crate (C build scripts,
+  # e.g. aws-lc-sys/ring) at gcc explicitly, and link via mold (needs gcc >= 12.1
+  # for -fuse-ld=mold).
+  # This env var OVERRIDES the rustflags in .cargo/config.toml, so it must
+  # repeat the static-libgcc flags from there (see the comment in that file).
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "gcc"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C link-arg=-static-libgcc -L native=.cargo"
+  CC: "gcc"
+  SONARQUBE: "$CI_PROJECT_DIR/sonarqube"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+stages:
+  - build
+  - test
+  - sast
+  - deps
+  - sonar
+  - release
+
+# Registry + build caches, keyed on the lockfile (like the go.sum key).
+.cargo-cache: &cargo-cache
+  cache:
+    - key:
+        files:
+          - Cargo.lock
+      paths:
+        - .cache/cargo/registry
+        - target
+    # Installed tools (nextest, llvm-cov, audit) survive lockfile changes.
+    # v2: forces reinstall of cargo-audit >= 0.22 (needed for --format sarif);
+    # the `which || install` guard would otherwise keep an older cached binary.
+    - key: rust-tools-v2
+      paths:
+        - .cache/cargo/bin
+
+build:
+  stage: build
+  <<: *cargo-cache
+  script:
+    - rustc --version && cargo --version
+    - cargo build --locked --all-targets
+
+unit-tests:
+  stage: test
+  <<: *cargo-cache
+  needs: [build]
+  script:
+    - mkdir -p "$SONARQUBE"
+    - which cargo-nextest || cargo install cargo-nextest --locked
+    - which cargo-llvm-cov || cargo install cargo-llvm-cov --locked
+    # One instrumented test run produces junit (nextest ci profile) + coverage;
+    # `report` reuses the profdata without re-running anything.
+    # The db_tests download self-contained embedded-Postgres binaries (zonky)
+    # into $HOME/.theseus/postgresql-zonky on first run; on a persistent
+    # runner that cache survives across pipelines.
+    - cargo llvm-cov nextest --locked --profile ci --lcov --output-path "$SONARQUBE/lcov.info"
+    - cargo llvm-cov report --cobertura --output-path "$SONARQUBE/cobertura.xml"
+    - cp target/nextest/ci/junit.xml "$SONARQUBE/junit.xml"
+    # Line coverage for the GitLab badge/MR widget, parsed from cobertura.
+    # Single awk, no pipeline: the runner script runs with pipefail, and a
+    # `head -1` closing the pipe early turns into SIGPIPE (exit 141).
+    - |
+      awk 'match($0, /line-rate="[0-9.]+"/) { r = substr($0, RSTART+11, RLENGTH-12); printf "coverage: %.1f%%\n", r * 100; exit }' "$SONARQUBE/cobertura.xml"
+  coverage: '/^coverage: (\d+\.\d+)%/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: sonarqube/cobertura.xml
+      junit: sonarqube/junit.xml
+    paths:
+      - sonarqube/lcov.info
+      - sonarqube/cobertura.xml
+      - sonarqube/junit.xml
+    expire_in: 7 days
+
+rustfmt:
+  stage: sast
+  needs: []
+  script:
+    - cargo fmt --check
+
+clippy:
+  stage: sast
+  <<: *cargo-cache
+  needs: [build]
+  script:
+    - mkdir -p "$SONARQUBE"
+    # JSON report for SonarQube first (does not fail the job), then the
+    # cached re-run as the actual gate: warnings are errors.
+    - cargo clippy --all-targets --locked --message-format=json > "$SONARQUBE/clippy-report.json" || true
+    - cargo clippy --all-targets --locked -- -D warnings
+  artifacts:
+    when: always
+    paths:
+      - sonarqube/clippy-report.json
+    expire_in: 7 days
+
+cargo-audit:
+  stage: deps
+  <<: *cargo-cache
+  needs: []
+  allow_failure: true
+  script:
+    - which cargo-audit || cargo install cargo-audit --locked
+    - mkdir -p "$SONARQUBE"
+    # Native SARIF (cargo-audit >= 0.22): RUSTSEC ids as rules, located on
+    # Cargo.lock — imported by sonar-job. `|| true` because findings make
+    # cargo-audit exit non-zero; the plain re-run below stays the visible gate.
+    - cargo audit --format sarif > "$SONARQUBE/audit.sarif" || true
+    - cargo audit
+  artifacts:
+    when: always
+    paths:
+      - sonarqube/audit.sarif
+    expire_in: 7 days
+
+# Informational second opinion (GHSA/OSV data): SARIF as a job artifact only.
+# Not imported into Sonar (cargo-audit is the source there); the GitLab
+# dependency_scanning report (gitlab.tpl) was dropped — GitLab choked on it.
+dependency-scan:
+  stage: deps
+  needs: []
+  allow_failure: true
+  script:
+    - mkdir -p "$SONARQUBE"
+    - trivy fs --scanners vuln --format sarif -o "$SONARQUBE/trivy.sarif" .
+  artifacts:
+    when: always
+    paths:
+      - sonarqube/trivy.sarif
+    expire_in: 7 days
+
+sonar-job:
+  stage: sonar
+  needs:
+    - unit-tests
+    - clippy
+    # allow_failure-Job: artifacts are available even when the audit gate is red.
+    - cargo-audit
+  allow_failure: false
+  script:
+    # Cargo.lock is listed as a source so the scanner indexes it — imported
+    # SARIF issues can only attach to indexed files.
+    - sonar-scanner
+        -Dsonar.token=$SONAR_TOKEN
+        -Dsonar.projectKey=$SONAR_PROJECT_KEY
+        -Dsonar.sources=src,Cargo.lock
+        -Dsonar.tests=tests
+        -Dsonar.exclusions=**/.cache/**,**/target/**
+        -Dsonar.coverage.exclusions=src/main.rs,src/telemetry.rs,src/spotify/session.rs,src/spotify/mod.rs,src/bin/**
+        -Dsonar.rust.lcov.reportPaths=$SONARQUBE/lcov.info
+        -Dsonar.rust.clippy.reportPaths=$SONARQUBE/clippy-report.json
+        -Dsonar.sarifReportPaths=$SONARQUBE/audit.sarif
+        -Dsonar.qualitygate.wait=true
+
+# Native release binary, built on the CI VM (glibc of the runner = minimum
+# glibc of the deploy target — runner and prod VM should match distros).
+release-build-dev:
+  stage: release
+  <<: *cargo-cache
+  needs: [unit-tests, rustfmt, clippy]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - VERSION="dev-1.$(date +%-y).$(date +%-V).${CI_PIPELINE_IID}"
+    - echo "Building version ${VERSION}"
+    # NP_BUILD_VERSION is baked into the binary as the service.version OTEL
+    # resource attribute (option_env! in src/telemetry.rs).
+    - NP_BUILD_VERSION="${VERSION}" cargo build --release --locked --bin nowplaying
+    - install -D target/release/nowplaying "dist/nowplaying-${VERSION}"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+release-build-push:
+  stage: release
+  <<: *cargo-cache
+  needs: [unit-tests, rustfmt, clippy, sonar-job]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - VERSION="1.$(date +%-y).$(date +%-V).${CI_PIPELINE_IID}"
+    - echo "Building version ${VERSION}"
+    # NP_BUILD_VERSION is baked into the binary as the service.version OTEL
+    # resource attribute (option_env! in src/telemetry.rs).
+    - NP_BUILD_VERSION="${VERSION}" cargo build --release --locked --bin nowplaying
+    - install -D target/release/nowplaying "dist/nowplaying-${VERSION}"
+    - git tag "$VERSION" "$CI_COMMIT_SHA" 2>/dev/null || true
+    - git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "$VERSION" 2>/dev/null || true
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 30 days

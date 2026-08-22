@@ -1,0 +1,4 @@
+/target
+/spike-cache
+sonarqube/
+dist/

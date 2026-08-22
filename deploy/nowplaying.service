@@ -1,0 +1,28 @@
+[Unit]
+Description=nowplaying - Spotify live widget backend
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nowplaying
+Group=nowplaying
+ExecStart=/usr/local/bin/nowplaying
+EnvironmentFile=/etc/nowplaying/env
+# Credentials cache; must be writable by the service user.
+StateDirectory=nowplaying
+Environment=NP_CACHE_DIR=/var/lib/nowplaying/cache
+
+# The app deliberately exits after too many Spotify reconnect failures;
+# systemd takes over from there.
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nowplaying
+
+[Install]
+WantedBy=multi-user.target

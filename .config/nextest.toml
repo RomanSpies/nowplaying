@@ -1,0 +1,8 @@
+# The `ci` profile is used by the GitLab pipeline (JUnit report for the MR
+# test widget and SonarQube).
+[profile.ci]
+failure-output = "immediate-final"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

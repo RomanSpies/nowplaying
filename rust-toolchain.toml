@@ -1,0 +1,5 @@
+# Pinned toolchain: CI and every dev machine build with the same compiler
+# (rustup picks this up automatically). llvm-tools is needed by cargo-llvm-cov.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "llvm-tools"]

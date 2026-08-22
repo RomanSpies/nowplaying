@@ -1,0 +1,16 @@
+# Link libgcc statically. rustc's unwind runtime emits an explicit `-lgcc_s`,
+# which plain `-static-libgcc` cannot rewrite — so `.cargo/libgcc_s.a` (a
+# linker script: GROUP(-lgcc_eh -lgcc)) shadows the shared library via the -L
+# search path and resolves the unwinder from the static archives instead.
+# Result: no libgcc_s.so.1 NEEDED entry, no runtime tie to the build machine's
+# (custom) gcc installation. Verify after toolchain changes with:
+#   readelf -d target/release/nowplaying | grep NEEDED
+#
+# NOTE: the relative -L path assumes cargo runs from the project root. CI sets
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS (env overrides this file!)
+# and must carry these flags too.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-static-libgcc",
+    "-L", "native=.cargo",
+]
