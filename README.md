@@ -58,9 +58,17 @@ leichte Live-Delta, korreliert über `track_id`):
   "cover_url": "https://i.scdn.co/image/…",
   "duration_ms": 213000,
   "started_at": "2026-07-28T12:34:56Z",
-  "playback": { "state": "playing", "position_ms": 0, "as_of": "2026-07-28T12:34:56Z" }
+  "playback": { "state": "playing", "position_ms": 0, "as_of": "2026-07-28T12:34:56Z" },
+  "lyrics": { "lines": [ { "start_ms": 1000, "end_ms": 4200, "text": "Nzqmr gswby lkvv ehm tp" } ] }
 }
 ```
+
+`lyrics` ist optional und nur vorhanden, wenn zeilensynchronisierte Lyrics
+existieren (`play`/`now_playing` und `/api/now-playing`; `state`-Frames tragen
+es nie). Der Text ist serverseitig gescrambelt — erster Buchstabe jedes Worts
+echt, Rest durch zufällige Buchstaben gleicher Case-Klasse ersetzt, Zeichen-
+länge/Interpunktion/Zeilenstruktur und Timestamps echt. Gedacht als
+verwaschener Hintergrund, der per `playback`-Extrapolation mitläuft.
 
 ```json
 {

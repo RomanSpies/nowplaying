@@ -1,4 +1,5 @@
 pub mod cluster;
+pub mod lyrics;
 pub mod metadata;
 pub mod pending;
 pub mod session;
@@ -129,7 +130,7 @@ async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow::Re
             }
             Err(e) => {
                 state.set_spotify_connected(false);
-                error!("spotify connection failed: {e:#}");
+                warn!("spotify connection failed: {e:#}");
             }
         }
         if *shutdown.borrow() {
@@ -443,6 +444,7 @@ async fn build_event<F: FetchTrack>(
             snapshot.duration_ms.max(0) as u32
         },
         started_at,
+        lyrics: meta.lyrics,
     })
 }
 
@@ -496,7 +498,9 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::spotify::metadata::test_support::{ScriptedFetcher, full_meta};
+    use crate::spotify::metadata::test_support::{
+        ScriptedFetcher, full_meta, full_meta_with_lyrics,
+    };
 
     const TRACK_A: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
     const ID_A: &str = "4uLU6hMCjMI75M1A2tKUQC";
@@ -792,6 +796,30 @@ mod tests {
 
         h.feed(&resolver, stop).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn play_frame_carries_scrambled_lyrics() {
+        let mut h = Harness::new();
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(
+            full_meta_with_lyrics("Song A"),
+        )]));
+        let mut rx = h.state.tx.subscribe();
+
+        h.feed(&resolver, update(TRACK_A, 0, true, false)).await;
+        let frame = rx.try_recv().unwrap();
+        assert_eq!(frame.kind, FrameKind::Play);
+        let v = json(&frame);
+        assert_eq!(v["lyrics"]["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(v["lyrics"]["lines"][0]["start_ms"], 1_000);
+
+        h.feed(&resolver, update(TRACK_A, 100, true, true)).await;
+        let state_frame = json(&rx.try_recv().unwrap());
+        assert_eq!(state_frame["type"], "state");
+        assert!(
+            state_frame.get("lyrics").is_none(),
+            "state frames must stay light"
+        );
     }
 
     /// A stopped track never becomes a play, so no fetch is scripted.

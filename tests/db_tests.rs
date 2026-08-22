@@ -68,6 +68,7 @@ fn play(track_id: &str, title: &str, artists: &[&str], days_ago: i64) -> PlayEve
         cover_url: Some("https://i.scdn.co/image/abc".into()),
         duration_ms: 200_000,
         started_at,
+        lyrics: None,
     }
 }
 

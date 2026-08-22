@@ -57,6 +57,7 @@ fn sample_play() -> PlayEvent {
         cover_url: None,
         duration_ms: 213_000,
         started_at: "2026-07-29T12:00:00Z".parse().unwrap(),
+        lyrics: None,
     }
 }
 

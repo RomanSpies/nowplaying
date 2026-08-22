@@ -13,12 +13,15 @@ use opentelemetry::metrics::{Counter, Histogram};
 use tokio::sync::Mutex;
 use tracing::{instrument, warn};
 
+use crate::spotify::lyrics;
+
 const IMAGE_URL_FALLBACK: &str = "https://i.scdn.co/image/{file_id}";
 
 struct MetaMetrics {
     fetch_duration: Histogram<f64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
+    lyrics_fetch: Counter<u64>,
 }
 
 /// Fetch-duration boundaries mirror the semconv `http.server.request.duration`
@@ -46,6 +49,10 @@ fn metrics() -> &'static MetaMetrics {
                 .u64_counter("metadata_cache_misses_total")
                 .with_description("Metadata lookups that required a fetch")
                 .build(),
+            lyrics_fetch: meter
+                .u64_counter("lyrics_fetch_total")
+                .with_description("Lyrics fetches by outcome (ok|unsynced|none|error)")
+                .build(),
         }
     })
 }
@@ -57,6 +64,8 @@ pub struct TrackMeta {
     pub album: String,
     pub cover_url: Option<String>,
     pub duration_ms: u32,
+    /// Present iff line-synced, scrambled lyrics exist (see spotify::lyrics).
+    pub lyrics: Option<crate::events::Lyrics>,
 }
 
 /// The one part of metadata resolution that needs a live Spotify session:
@@ -73,7 +82,9 @@ pub trait FetchTrack: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<TrackMeta>> + Send;
 }
 
-/// Production fetcher: `Track::get` plus the session's cover-URL template.
+/// Production fetcher: `Track::get` plus the session's cover-URL template,
+/// with the lyrics fetch running concurrently (latency = max, not sum). A
+/// failed lyrics fetch never fails the track — it only degrades to `None`.
 pub struct SessionFetcher {
     session: Session,
 }
@@ -81,10 +92,18 @@ pub struct SessionFetcher {
 impl FetchTrack for SessionFetcher {
     async fn fetch(&self, track_uri: &str) -> anyhow::Result<TrackMeta> {
         let uri = SpotifyUri::from_uri(track_uri).context("parsing track uri")?;
-        let track = Track::get(&self.session, &uri)
-            .await
-            .map_err(|e| anyhow::anyhow!("Track::get: {e}"))?;
+        let (track_id, _) = track_url(track_uri)?;
+        let (track, lyrics_fetch) = tokio::join!(
+            Track::get(&self.session, &uri),
+            lyrics::fetch(&self.session, &track_id)
+        );
 
+        metrics()
+            .lyrics_fetch
+            .add(1, &[KeyValue::new("outcome", lyrics_fetch.label())]);
+        tracing::Span::current().record("lyrics", lyrics_fetch.label());
+
+        let track = track.map_err(|e| anyhow::anyhow!("Track::get: {e}"))?;
         let template = self
             .session
             .get_user_attribute("image-url")
@@ -97,6 +116,7 @@ impl FetchTrack for SessionFetcher {
             album: track.album.name,
             cover_url,
             duration_ms: track.duration.max(0) as u32,
+            lyrics: lyrics_fetch.into_option(),
         })
     }
 }
@@ -131,7 +151,11 @@ impl<F: FetchTrack> MetadataResolver<F> {
     #[instrument(
         name = "metadata.resolve",
         skip(self, cluster_meta),
-        fields(track_uri = %track_uri, source = tracing::field::Empty)
+        fields(
+            track_uri = %track_uri,
+            source = tracing::field::Empty,
+            lyrics = tracing::field::Empty,
+        )
     )]
     pub async fn resolve(
         &self,
@@ -212,6 +236,7 @@ fn from_cluster_map(meta: &HashMap<String, String>, duration_hint_ms: i64) -> Op
         album,
         cover_url,
         duration_ms,
+        lyrics: None,
     })
 }
 
@@ -277,14 +302,53 @@ pub(crate) mod test_support {
             album: "Album".into(),
             cover_url: Some("https://i.scdn.co/image/abc".into()),
             duration_ms: 200_000,
+            lyrics: None,
+        }
+    }
+
+    pub(crate) fn full_meta_with_lyrics(title: &str) -> TrackMeta {
+        TrackMeta {
+            lyrics: Some(crate::events::Lyrics {
+                lines: vec![
+                    crate::events::LyricLine {
+                        start_ms: 1_000,
+                        end_ms: 4_200,
+                        text: "Nzqmr gswby lkvv ehm tp".into(),
+                    },
+                    crate::events::LyricLine {
+                        start_ms: 4_200,
+                        end_ms: 8_000,
+                        text: "Nzqmr gswby lkvv ehm dgnn".into(),
+                    },
+                ],
+            }),
+            ..full_meta(title)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{ScriptedFetcher, full_meta};
+    use super::test_support::{ScriptedFetcher, full_meta, full_meta_with_lyrics};
     use super::*;
+
+    #[tokio::test]
+    async fn lyrics_ride_the_track_meta_and_its_cache() {
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(
+            full_meta_with_lyrics("Song A"),
+        )]));
+        let meta = resolver
+            .resolve("spotify:track:a", &HashMap::new(), 0)
+            .await
+            .unwrap();
+        assert_eq!(meta.lyrics.as_ref().unwrap().lines.len(), 2);
+
+        let cached = resolver
+            .resolve("spotify:track:a", &HashMap::new(), 0)
+            .await
+            .unwrap();
+        assert_eq!(cached.lyrics, meta.lyrics);
+    }
 
     #[tokio::test]
     async fn resolve_caches_successful_fetches() {

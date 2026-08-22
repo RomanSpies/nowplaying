@@ -257,6 +257,7 @@ mod tests {
             cover_url: None,
             duration_ms: 200_000,
             started_at: "2026-07-28T12:00:00Z".parse().unwrap(),
+            lyrics: None,
         }
     }
 

@@ -2,7 +2,9 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-/// A single playback of a track, as pushed to WSS clients and stored in Postgres.
+/// A single playback of a track, as pushed to WSS clients and stored in
+/// Postgres. `lyrics` travels only on the wire (never persisted) and is
+/// present iff line-synced, server-side scrambled lyrics exist for the track.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayEvent {
     pub track_id: String,
@@ -13,6 +15,24 @@ pub struct PlayEvent {
     pub cover_url: Option<String>,
     pub duration_ms: u32,
     pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lyrics: Option<Lyrics>,
+}
+
+/// Line-synced, scrambled lyrics: real line structure, lengths and
+/// timestamps, but every word reduced to its first letter plus seeded-random
+/// replacements — the expressive content never leaves the server (see
+/// spotify::lyrics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Lyrics {
+    pub lines: Vec<LyricLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LyricLine {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
 }
 
 /// Identity of a play, independent of the wire framing. Used on the WS path
@@ -127,6 +147,7 @@ mod tests {
             cover_url: Some("https://i.scdn.co/image/abc".into()),
             duration_ms: 213_000,
             started_at: "2026-07-28T12:00:00Z".parse().unwrap(),
+            lyrics: None,
         }
     }
 
@@ -154,6 +175,41 @@ mod tests {
         assert_eq!(now["type"], "now_playing");
         assert_eq!(now["duration_ms"], 213_000);
         assert_eq!(now["playback"]["state"], "paused");
+    }
+
+    #[test]
+    fn lyrics_are_optional_and_ride_the_play_frames() {
+        let bare = sample();
+        let play: serde_json::Value =
+            serde_json::from_slice(&bare.to_ws_bytes(false, sample_playback())).unwrap();
+        assert!(
+            play.get("lyrics").is_none(),
+            "absent lyrics must not serialize a field"
+        );
+
+        let mut with_lyrics = sample();
+        with_lyrics.lyrics = Some(Lyrics {
+            lines: vec![
+                LyricLine {
+                    start_ms: 1_000,
+                    end_ms: 4_200,
+                    text: "Nzqmr gswby lkvv ehm tp".into(),
+                },
+                LyricLine {
+                    start_ms: 4_200,
+                    end_ms: 8_000,
+                    text: "Nzqmr gswby lkvv ehm dgnn".into(),
+                },
+            ],
+        });
+        let play: serde_json::Value =
+            serde_json::from_slice(&with_lyrics.to_ws_bytes(false, sample_playback())).unwrap();
+        assert_eq!(play["lyrics"]["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(play["lyrics"]["lines"][0]["start_ms"], 1_000);
+        assert_eq!(
+            play["lyrics"]["lines"][1]["text"],
+            "Nzqmr gswby lkvv ehm dgnn"
+        );
     }
 
     /// Nothing beyond `type`/`track_id`/`playback` may leak into the light

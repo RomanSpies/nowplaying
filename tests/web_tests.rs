@@ -78,6 +78,7 @@ fn play(title: &str) -> PlayEvent {
         cover_url: None,
         duration_ms: 213_000,
         started_at: base + chrono::Duration::seconds(offset),
+        lyrics: None,
     }
 }
 
@@ -397,4 +398,49 @@ async fn replay_and_api_reflect_state_published_after_the_play() {
     assert_eq!(body["title"], "PauseMe");
     assert_eq!(body["playback"]["state"], "paused");
     assert_eq!(body["playback"]["position_ms"], 83_000);
+}
+
+#[tokio::test]
+async fn lyrics_ride_replay_and_api_when_present() {
+    let state = test_state();
+    let addr = spawn_server(state.clone()).await;
+
+    let mut event = play("With Lyrics");
+    event.lyrics = Some(nowplaying::events::Lyrics {
+        lines: vec![nowplaying::events::LyricLine {
+            start_ms: 1_000,
+            end_ms: 4_200,
+            text: "Nzqmr gswby lkvv ehm tp".into(),
+        }],
+    });
+    state.publish_play(event, playing_now()).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let replay = recv_json(&mut ws).await;
+    assert_eq!(replay["type"], "now_playing");
+    assert_eq!(
+        replay["lyrics"]["lines"][0]["text"],
+        "Nzqmr gswby lkvv ehm tp"
+    );
+
+    let text = reqwest::get(format!("http://{addr}/api/now-playing"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["lyrics"]["lines"][0]["start_ms"], 1_000);
+
+    state
+        .publish_play(play("Without Lyrics"), playing_now())
+        .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], "play");
+    assert!(
+        msg.get("lyrics").is_none(),
+        "absent lyrics must omit the field"
+    );
 }
