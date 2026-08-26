@@ -179,7 +179,12 @@ async fn run_once(
     metrics: &Metrics,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let (session, mut cluster_stream, spirc, spirc_task) = async {
+    let connect_span = info_span!(
+        "spotify.connect",
+        device_name = %state.cfg.device_name,
+        otel.status_code = tracing::field::Empty,
+    );
+    let connected = async {
         let bundle = session::build(&state.cfg)?;
         let session = bundle.session.clone();
 
@@ -199,11 +204,15 @@ async fn run_once(
         .map_err(|e| anyhow::anyhow!("starting Spirc: {e}"))?;
         anyhow::Ok((session, cluster_stream, spirc, spirc_task))
     }
-    .instrument(info_span!(
-        "spotify.connect",
-        device_name = %state.cfg.device_name,
-    ))
-    .await?;
+    .instrument(connect_span.clone())
+    .await;
+    let (session, mut cluster_stream, spirc, spirc_task) = match connected {
+        Ok(parts) => parts,
+        Err(e) => {
+            connect_span.record("otel.status_code", "ERROR");
+            return Err(e);
+        }
+    };
     let mut spirc_task = std::pin::pin!(spirc_task);
 
     state.set_spotify_connected(true);

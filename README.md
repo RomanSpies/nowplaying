@@ -32,10 +32,15 @@ das aktive Wiedergabegerät ist.
     (source=cache|fetch|cluster_map), `play.persist` (hängt als spätes Kind am
     Trace des auslösenden Updates), DB-Spans mit track_id/limit.
   - Fehler-Spans tragen `otel.status_code=ERROR` (Request-Spans bei 5xx,
-    metadata_failed, fehlgeschlagener Persist) — in Tempo/Grafana als
-    fehlgeschlagen filterbar. Pool-Sättigung via `db.client.connection.count`
-    {state=used|idle} und `db.client.connection.max` (semconv); vom
-    Replay-Guard geschluckte Plays via `plays_replay_suppressed_total`.
+    metadata_failed, fehlgeschlagener Persist, spotify.connect) — in
+    Tempo/Grafana als fehlgeschlagen filterbar. Pool-Sättigung via
+    `db.client.connection.count` {state=used|idle} und
+    `db.client.connection.max` (semconv); vom Replay-Guard geschluckte Plays
+    via `plays_replay_suppressed_total`. DB-Latenz je Operation als
+    `db.client.operation.duration{db.operation.name}`, WS-Session-Dauern als
+    `ws_session_duration`-Histogramm, Spotify-API-Nutzung via
+    `spotify_api_requests_total`/`spotify_api_response_bytes_total{endpoint}`
+    (Payload-Ebene — Dealer-Stream, AP-Session und TLS nicht enthalten).
 
 ## API
 

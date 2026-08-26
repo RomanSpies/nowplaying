@@ -12,8 +12,11 @@
 use librespot::core::error::ErrorKind;
 use librespot::core::{Session, SpotifyId};
 use librespot::metadata::lyrics::{Lyrics as SpotifyLyrics, SyncType};
+use opentelemetry::KeyValue;
+use tracing::warn;
 
 use crate::events::{LyricLine, Lyrics};
+use crate::spotify::metadata::api_metrics;
 
 /// Outcome of a lyrics fetch, labelled for the `lyrics_fetch_total` metric.
 pub enum LyricsFetch {
@@ -42,15 +45,34 @@ impl LyricsFetch {
 }
 
 /// Fetch and scramble the lyrics for a base62 track id. Never fails the
-/// caller: every problem degrades to a non-`Synced` outcome.
+/// caller: every problem degrades to a non-`Synced` outcome, logged with its
+/// cause so a rising `outcome=error` rate is diagnosable.
 pub async fn fetch(session: &Session, track_id: &str) -> LyricsFetch {
     let Ok(id) = SpotifyId::from_base62(track_id) else {
+        warn!(track_id, "lyrics fetch skipped, unparsable track id");
         return LyricsFetch::Error;
     };
-    match SpotifyLyrics::get(session, &id).await {
-        Ok(lyrics) => convert(lyrics, track_id),
+    api_metrics()
+        .requests
+        .add(1, &[KeyValue::new("endpoint", "lyrics")]);
+    match session.spclient().get_lyrics(&id).await {
+        Ok(bytes) => {
+            api_metrics()
+                .response_bytes
+                .add(bytes.len() as u64, &[KeyValue::new("endpoint", "lyrics")]);
+            match SpotifyLyrics::try_from(&bytes) {
+                Ok(lyrics) => convert(lyrics, track_id),
+                Err(e) => {
+                    warn!(track_id, "lyrics response undecodable: {e}");
+                    LyricsFetch::Error
+                }
+            }
+        }
         Err(e) if e.kind == ErrorKind::NotFound => LyricsFetch::Missing,
-        Err(_) => LyricsFetch::Error,
+        Err(e) => {
+            warn!(track_id, "lyrics fetch failed: {e}");
+            LyricsFetch::Error
+        }
     }
 }
 

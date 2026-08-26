@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -22,6 +22,9 @@ struct WsMetrics {
     connections: UpDownCounter<i64>,
     sent: Counter<u64>,
     lagged: Counter<u64>,
+    /// Coarse buckets: a spike at exactly 60s/75s is the fingerprint of a
+    /// proxy idle-timeout misconfiguration killing healthy sessions.
+    session_duration: Histogram<f64>,
 }
 
 fn metrics() -> &'static WsMetrics {
@@ -40,6 +43,14 @@ fn metrics() -> &'static WsMetrics {
             lagged: meter
                 .u64_counter("ws_lagged_total")
                 .with_description("Times a slow client skipped broadcast messages")
+                .build(),
+            session_duration: meter
+                .f64_histogram("ws_session_duration")
+                .with_unit("s")
+                .with_description("WebSocket session lifetime from accept to disconnect")
+                .with_boundaries(vec![
+                    1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0,
+                ])
                 .build(),
         }
     })
@@ -107,6 +118,8 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     if let Some((key, frame)) = replay {
         if send_frame(&mut socket, &frame).await.is_err() {
             m.connections.add(-1, &[]);
+            m.session_duration
+                .record(connected_at.elapsed().as_secs_f64(), &[]);
             return;
         }
         m.sent.add(1, &[]);
@@ -161,6 +174,8 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     }
 
     m.connections.add(-1, &[]);
+    m.session_duration
+        .record(connected_at.elapsed().as_secs_f64(), &[]);
     info!(
         session_duration_s = connected_at.elapsed().as_secs(),
         "ws client disconnected"

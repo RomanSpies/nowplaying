@@ -65,7 +65,9 @@ fn sample_play() -> PlayEvent {
 /// walking the data model: the SDK's metric-data API churns between minor
 /// versions, the rendered content does not. Good enough to prove "this
 /// instrument recorded with this attribute" — value-level assertions live
-/// with the code paths' logic tests.
+/// with the code paths' logic tests. The WS session duration is recorded
+/// only once the server-side loop observes the close, so the test polls
+/// briefly for it before the final flush.
 #[tokio::test]
 async fn instruments_record_on_their_code_paths() {
     let exporter = InMemoryMetricExporter::default();
@@ -107,6 +109,17 @@ async fn instruments_record_on_their_code_paths() {
         .unwrap();
     assert!(msg.is_text());
     ws.close(None).await.ok();
+    for _ in 0..40 {
+        provider.force_flush().expect("flush metrics");
+        let dump = format!(
+            "{:?}",
+            exporter.get_finished_metrics().expect("exported metrics")
+        );
+        if dump.contains("ws_session_duration") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let discarded = global::meter("nowplaying")
         .u64_counter("plays_discarded_total")
@@ -133,6 +146,8 @@ async fn instruments_record_on_their_code_paths() {
         "top_artists",
         "ws_connections_active",
         "ws_messages_sent_total",
+        "ws_session_duration",
+        "db.client.operation.duration",
         "plays_discarded_total",
         "superseded",
     ] {

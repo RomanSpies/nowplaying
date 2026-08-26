@@ -6,10 +6,12 @@ use std::time::Instant;
 use anyhow::Context;
 use librespot::core::{Session, SpotifyUri};
 use librespot::metadata::{Metadata, Track};
+use librespot::protocol::metadata::Track as TrackMessage;
 use lru::LruCache;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
+use protobuf::Message as _;
 use tokio::sync::Mutex;
 use tracing::{instrument, warn};
 
@@ -57,6 +59,31 @@ fn metrics() -> &'static MetaMetrics {
     })
 }
 
+pub(crate) struct SpotifyApiMetrics {
+    pub(crate) requests: Counter<u64>,
+    pub(crate) response_bytes: Counter<u64>,
+}
+
+/// Usage accounting for our spclient calls. Application payload only: the
+/// dealer stream, AP session traffic and TLS overhead are not visible from
+/// inside librespot and are deliberately out of scope.
+pub(crate) fn api_metrics() -> &'static SpotifyApiMetrics {
+    static METRICS: OnceLock<SpotifyApiMetrics> = OnceLock::new();
+    METRICS.get_or_init(|| {
+        let meter = global::meter("nowplaying");
+        SpotifyApiMetrics {
+            requests: meter
+                .u64_counter("spotify_api_requests_total")
+                .with_description("Requests to Spotify's spclient API by endpoint")
+                .build(),
+            response_bytes: meter
+                .u64_counter("spotify_api_response_bytes_total")
+                .with_description("Payload bytes received from Spotify's spclient API by endpoint")
+                .build(),
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct TrackMeta {
     pub title: String,
@@ -93,17 +120,29 @@ impl FetchTrack for SessionFetcher {
     async fn fetch(&self, track_uri: &str) -> anyhow::Result<TrackMeta> {
         let uri = SpotifyUri::from_uri(track_uri).context("parsing track uri")?;
         let (track_id, _) = track_url(track_uri)?;
-        let (track, lyrics_fetch) = tokio::join!(
-            Track::get(&self.session, &uri),
-            lyrics::fetch(&self.session, &track_id)
-        );
+
+        let track_fut = async {
+            api_metrics()
+                .requests
+                .add(1, &[KeyValue::new("endpoint", "metadata")]);
+            let bytes = Track::request(&self.session, &uri)
+                .await
+                .map_err(|e| anyhow::anyhow!("Track::request: {e}"))?;
+            api_metrics()
+                .response_bytes
+                .add(bytes.len() as u64, &[KeyValue::new("endpoint", "metadata")]);
+            let msg = TrackMessage::parse_from_bytes(&bytes).context("decoding track protobuf")?;
+            Track::parse(&msg, &uri).map_err(|e| anyhow::anyhow!("Track::parse: {e}"))
+        };
+        let (track, lyrics_fetch) =
+            tokio::join!(track_fut, lyrics::fetch(&self.session, &track_id));
 
         metrics()
             .lyrics_fetch
             .add(1, &[KeyValue::new("outcome", lyrics_fetch.label())]);
         tracing::Span::current().record("lyrics", lyrics_fetch.label());
 
-        let track = track.map_err(|e| anyhow::anyhow!("Track::get: {e}"))?;
+        let track = track?;
         let template = self
             .session
             .get_user_attribute("image-url")

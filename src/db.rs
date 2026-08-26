@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::ObservableGauge;
+use opentelemetry::metrics::{Histogram, ObservableGauge};
 use serde::Serialize;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -15,6 +17,33 @@ const POOL_MAX_CONNECTIONS: u32 = 5;
 /// Kept for the process lifetime so the observable callbacks stay registered
 /// (same pattern as the `spotify_connected` gauge in spotify::Metrics).
 static POOL_GAUGES: OnceLock<[ObservableGauge<u64>; 2]> = OnceLock::new();
+
+/// Semconv boundaries for local-Postgres scale; recorded on success and
+/// failure alike — a query that errors after seconds is exactly what this
+/// histogram must show.
+fn operation_duration() -> &'static Histogram<f64> {
+    static HISTOGRAM: OnceLock<Histogram<f64>> = OnceLock::new();
+    HISTOGRAM.get_or_init(|| {
+        global::meter("nowplaying")
+            .f64_histogram("db.client.operation.duration")
+            .with_unit("s")
+            .with_description("Postgres operation latency by operation name")
+            .with_boundaries(vec![
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ])
+            .build()
+    })
+}
+
+async fn timed<T>(op: &'static str, fut: impl Future<Output = sqlx::Result<T>>) -> sqlx::Result<T> {
+    let started = Instant::now();
+    let result = fut.await;
+    operation_duration().record(
+        started.elapsed().as_secs_f64(),
+        &[KeyValue::new("db.operation.name", op)],
+    );
+    result
+}
 
 /// Pool saturation is otherwise invisible: an exhausted pool (all
 /// POOL_MAX_CONNECTIONS in use) shows up only as request latency. Semconv
@@ -62,7 +91,8 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 /// swallows replays after reconnects. Returns whether a row was written.
 #[instrument(skip_all, fields(track_id = %event.track_id))]
 pub async fn insert_play(pool: &PgPool, event: &PlayEvent) -> sqlx::Result<bool> {
-    let result = sqlx::query(
+    timed("insert_play", async {
+        let result = sqlx::query(
         "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (track_id, started_at) DO NOTHING",
@@ -74,9 +104,11 @@ pub async fn insert_play(pool: &PgPool, event: &PlayEvent) -> sqlx::Result<bool>
     .bind(&event.cover_url)
     .bind(event.duration_ms as i32)
     .bind(event.started_at)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    })
+    .await
 }
 
 /// Insert a play unless one of the same track already exists within
@@ -89,7 +121,8 @@ pub async fn insert_play_guarded(
     event: &PlayEvent,
     guard_secs: f64,
 ) -> sqlx::Result<bool> {
-    let result = sqlx::query(
+    timed("insert_play_guarded", async {
+        let result = sqlx::query(
         "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at)
          SELECT $1, $2, $3, $4, $5, $6, $7
          WHERE NOT EXISTS (
@@ -108,9 +141,11 @@ pub async fn insert_play_guarded(
     .bind(event.duration_ms as i32)
     .bind(event.started_at)
     .bind(guard_secs)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    })
+    .await
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -135,8 +170,10 @@ pub struct TopArtist {
 /// build a 2D array whose indexing yields NULL.
 #[instrument(skip(pool))]
 pub async fn top_songs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopSong>> {
-    sqlx::query_as(
-        "WITH windowed AS (
+    timed(
+        "top_songs",
+        sqlx::query_as(
+            "WITH windowed AS (
              SELECT * FROM plays WHERE started_at >= now() - interval '30 days'
          ),
          counts AS (
@@ -156,23 +193,27 @@ pub async fn top_songs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopSong>> 
          JOIN latest l USING (track_id)
          ORDER BY c.plays DESC, c.track_id
          LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool),
     )
-    .bind(limit)
-    .fetch_all(pool)
     .await
 }
 
 #[instrument(skip(pool))]
 pub async fn top_artists(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopArtist>> {
-    sqlx::query_as(
-        "SELECT unnest(artists) AS artist, count(*) AS plays
+    timed(
+        "top_artists",
+        sqlx::query_as(
+            "SELECT unnest(artists) AS artist, count(*) AS plays
          FROM plays
          WHERE started_at >= now() - interval '30 days'
          GROUP BY artist
          ORDER BY plays DESC, artist
          LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool),
     )
-    .bind(limit)
-    .fetch_all(pool)
     .await
 }
