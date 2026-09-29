@@ -37,6 +37,10 @@ fn test_state() -> AppState {
         "30000",
         "--top-default-limit",
         "10",
+        "--ws-max-connections",
+        "1000",
+        "--ws-max-per-ip",
+        "8",
         "--log-filter",
         "info",
     ]);
@@ -50,7 +54,8 @@ fn test_state() -> AppState {
 fn sample_play() -> PlayEvent {
     PlayEvent {
         track_id: "4uLU6hMCjMI75M1A2tKUQC".into(),
-        track_url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into(),
+        kind: nowplaying::events::MediaKind::Track,
+        track_url: Some("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into()),
         title: "T".into(),
         artists: vec!["A".into()],
         album: "Al".into(),
@@ -58,6 +63,7 @@ fn sample_play() -> PlayEvent {
         duration_ms: 213_000,
         started_at: "2026-07-29T12:00:00Z".parse().unwrap(),
         lyrics: None,
+        metadata_source: nowplaying::events::MetadataSource::Fetch,
     }
 }
 

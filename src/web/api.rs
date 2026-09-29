@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -13,6 +13,7 @@ use tracing::{error, instrument};
 use crate::db::{self, TopArtist, TopSong};
 use crate::events::{PlayEvent, Playback};
 use crate::state::AppState;
+use crate::web::top_cache::{TOP_CACHE_DEPTH, TOP_CACHE_TTL, TopLists};
 
 /// Same instrument as in `spotify::Metrics` — name and description must
 /// match byte-for-byte or the SDK reports a duplicate-instrument conflict.
@@ -32,36 +33,66 @@ pub struct TopParams {
 }
 
 #[derive(Serialize)]
-pub struct TopResponse {
-    songs: Vec<TopSong>,
-    artists: Vec<TopArtist>,
+struct TopResponse<'a> {
+    songs: &'a [TopSong],
+    artists: &'a [TopArtist],
 }
 
-/// Most-played songs and artists of the rolling 30-day window. The queries
-/// run concurrently via `join!` (not `try_join!`) so failures keep their
-/// per-query attribution in the `db_errors_total` metric.
-#[instrument(skip_all)]
+/// Most-played songs and artists of the rolling 30-day window, served from
+/// the [`crate::web::top_cache::TopCache`] (one snapshot at full depth,
+/// sliced per `limit`). A reload runs both queries concurrently via `join!`
+/// (not `try_join!`) so failures keep their per-query attribution in the
+/// `db_errors_total` metric. Browsers may reuse a response for the cache TTL.
+#[instrument(
+    name = "api.top",
+    skip_all,
+    fields(limit, cache = tracing::field::Empty, cache.age_ms = tracing::field::Empty)
+)]
 pub async fn top(State(state): State<AppState>, Query(params): Query<TopParams>) -> Response {
     let limit = params
         .limit
         .unwrap_or(state.cfg.top_default_limit)
-        .clamp(1, 50) as i64;
+        .clamp(1, TOP_CACHE_DEPTH as u32) as usize;
+    let span = tracing::Span::current();
+    span.record("limit", limit);
 
-    let (songs, artists) = tokio::join!(
-        db::top_songs(&state.db, limit),
-        db::top_artists(&state.db, limit),
-    );
-    for (result, op) in [
-        (songs.is_err(), "top_songs"),
-        (artists.is_err(), "top_artists"),
-    ] {
-        if result {
-            db_errors().add(1, &[KeyValue::new("op", op)]);
+    let served = state
+        .top_cache
+        .get_or_load(|| async {
+            let (songs, artists) = tokio::join!(
+                db::top_songs(&state.db, TOP_CACHE_DEPTH),
+                db::top_artists(&state.db, TOP_CACHE_DEPTH),
+            );
+            for (failed, op) in [
+                (songs.is_err(), "top_songs"),
+                (artists.is_err(), "top_artists"),
+            ] {
+                if failed {
+                    db_errors().add(1, &[KeyValue::new("op", op)]);
+                }
+            }
+            Ok::<_, sqlx::Error>(TopLists {
+                songs: songs?,
+                artists: artists?,
+            })
+        })
+        .await;
+
+    match served {
+        Ok(served) => {
+            span.record("cache", served.outcome.as_str());
+            span.record("cache.age_ms", served.age.as_millis() as u64);
+            let lists = &served.lists;
+            let body = TopResponse {
+                songs: &lists.songs[..limit.min(lists.songs.len())],
+                artists: &lists.artists[..limit.min(lists.artists.len())],
+            };
+            let cache_control =
+                HeaderValue::from_str(&format!("public, max-age={}", TOP_CACHE_TTL.as_secs()))
+                    .expect("static header value");
+            ([(header::CACHE_CONTROL, cache_control)], Json(body)).into_response()
         }
-    }
-    match (songs, artists) {
-        (Ok(songs), Ok(artists)) => Json(TopResponse { songs, artists }).into_response(),
-        (Err(e), _) | (_, Err(e)) => {
+        Err(e) => {
             error!("top query failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -94,16 +125,21 @@ pub async fn now_playing(State(state): State<AppState>) -> Response {
 #[derive(Serialize)]
 pub struct Health {
     spotify_connected: bool,
+    spotify_auth_ok: bool,
     db_ok: bool,
 }
 
+/// 503 when the database is down or Spotify rejected the stored credentials
+/// — both need an operator. A transient Spotify reconnect stays 200
+/// (`spotify_connected: false`), since the service recovers on its own.
 pub async fn healthz(State(state): State<AppState>) -> Response {
     let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
     let health = Health {
         spotify_connected: state.is_spotify_connected(),
+        spotify_auth_ok: !state.is_spotify_auth_failed(),
         db_ok,
     };
-    let status = if health.db_ok {
+    let status = if health.db_ok && health.spotify_auth_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE

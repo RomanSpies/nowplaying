@@ -170,7 +170,7 @@ sonar-job:
         -Dsonar.sources=src,Cargo.lock
         -Dsonar.tests=tests
         -Dsonar.exclusions=**/.cache/**,**/target/**
-        -Dsonar.coverage.exclusions=src/main.rs,src/telemetry.rs,src/spotify/session.rs,src/spotify/mod.rs,src/bin/**
+        -Dsonar.coverage.exclusions=src/main.rs,src/telemetry.rs,src/spotify/session.rs,src/bin/**
         -Dsonar.rust.lcov.reportPaths=$SONARQUBE/lcov.info
         -Dsonar.rust.clippy.reportPaths=$SONARQUBE/clippy-report.json
         -Dsonar.sarifReportPaths=$SONARQUBE/audit.sarif

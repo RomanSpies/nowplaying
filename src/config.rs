@@ -58,6 +58,15 @@ pub struct Config {
     #[arg(long, env = "NP_TOP_LIMIT", default_value_t = 10)]
     pub top_default_limit: u32,
 
+    /// Maximum concurrent WebSocket sessions; further upgrades get 503.
+    #[arg(long, env = "NP_WS_MAX_CONNECTIONS", default_value_t = 1000)]
+    pub ws_max_connections: usize,
+
+    /// Maximum concurrent WebSocket sessions per client address (as
+    /// forwarded by nginx); further upgrades from it get 429.
+    #[arg(long, env = "NP_WS_MAX_PER_IP", default_value_t = 8)]
+    pub ws_max_per_ip: usize,
+
     /// tracing filter directives (also honours RUST_LOG).
     #[arg(long, env = "RUST_LOG", default_value = "info,librespot=warn")]
     pub log_filter: String,

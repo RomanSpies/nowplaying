@@ -13,10 +13,17 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::events::{FrameKind, PlayKey};
 use crate::state::AppState;
+use crate::web::ws_limits::Rejection;
 
 /// Proxies silently drop idle connections; periodic pings keep them open and
 /// surface dead peers as send errors.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// A peer that answered none of the pings in this span is gone, even if the
+/// TCP connection has not noticed yet.
+const PONG_TIMEOUT: Duration = Duration::from_secs(2 * KEEPALIVE_INTERVAL.as_secs());
+/// Clients never need to send more than control frames; the tungstenite
+/// default would buffer up to 64 MiB per inbound message.
+const MAX_INBOUND_BYTES: usize = 1024;
 
 struct WsMetrics {
     connections: UpDownCounter<i64>,
@@ -59,8 +66,11 @@ fn metrics() -> &'static WsMetrics {
 /// WS upgrade endpoint. CORS does not govern WebSocket handshakes, so the
 /// origin allowlist is enforced here: browsers always send `Origin` on WS
 /// upgrades, while requests without one (websocat, native clients) are
-/// allowed. An accepted session runs under a `ws.session` span carrying the
-/// visitor address until disconnect.
+/// allowed. Admission control follows (per-address 429, global 503; see
+/// [`crate::web::ws_limits`]); the permit lives as long as the session. An
+/// accepted session runs under a `ws.session` span carrying the visitor
+/// address plus, at the end, `close.reason`, `messages.sent` and
+/// `session.duration_s`.
 pub async fn handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -76,18 +86,74 @@ pub async fn handler(
                 .to_str()
                 .is_ok_and(|o| crate::web::origin_allowed(o, patterns));
         if !allowed {
-            warn!(?origin, client.address = %client, "rejecting ws upgrade from disallowed origin");
+            warn!(
+                ?origin,
+                client.address = %client,
+                reason = "origin",
+                "rejecting ws upgrade from disallowed origin"
+            );
             return StatusCode::FORBIDDEN.into_response();
         }
     }
-    let session_span = info_span!("ws.session", "client.address" = %client);
-    ws.on_failed_upgrade(move |e| warn!(client.address = %client, "websocket upgrade failed: {e}"))
-        .on_upgrade(move |socket| client_loop(socket, state).instrument(session_span))
+    let permit = match state.ws_limits.try_admit(&client) {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            warn!(
+                client.address = %client,
+                reason = rejection.as_str(),
+                "rejecting ws upgrade over the connection limit"
+            );
+            let status = match rejection {
+                Rejection::PerIpLimit => StatusCode::TOO_MANY_REQUESTS,
+                Rejection::GlobalLimit => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return status.into_response();
+        }
+    };
+    let session_span = info_span!(
+        "ws.session",
+        "client.address" = %client,
+        close.reason = tracing::field::Empty,
+        messages.sent = tracing::field::Empty,
+        session.duration_s = tracing::field::Empty,
+    );
+    ws.max_message_size(MAX_INBOUND_BYTES)
+        .max_frame_size(MAX_INBOUND_BYTES)
+        .on_failed_upgrade(
+            move |e| warn!(client.address = %client, "websocket upgrade failed: {e}"),
+        )
+        .on_upgrade(move |socket| {
+            async move {
+                let _permit = permit;
+                client_loop(socket, state).await;
+            }
+            .instrument(session_span)
+        })
         .into_response()
 }
 
+/// Why a session ended, recorded as `close.reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    ClientClose,
+    SendError,
+    PongTimeout,
+    ServerShutdown,
+}
+
+impl CloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientClose => "client_close",
+            Self::SendError => "send_error",
+            Self::PongTimeout => "pong_timeout",
+            Self::ServerShutdown => "server_shutdown",
+        }
+    }
+}
+
 /// Per-connection loop: subscribe, replay the cached `now_playing`, then
-/// forward broadcast frames until the client disconnects.
+/// forward broadcast frames until the session ends.
 ///
 /// Subscribing before reading the replay guarantees no event is missed; a
 /// play published in between would arrive twice, so `skip` holds the
@@ -96,8 +162,9 @@ pub async fn handler(
 /// self-corrects with the next event). Lagged clients are resynced with the
 /// current state instead of being disconnected, since skipped events are
 /// stale by definition. The keepalive interval's immediate first tick is
-/// consumed before the loop; inbound frames are drained (axum answers pings
-/// itself) and only `Close` or errors end the session.
+/// consumed before the loop; each later tick first checks that the peer
+/// answered a ping within [`PONG_TIMEOUT`]. Inbound frames are drained (axum
+/// answers pings itself); pongs refresh the liveness clock.
 async fn client_loop(mut socket: WebSocket, state: AppState) {
     let m = metrics();
     m.connections.add(1, &[]);
@@ -107,6 +174,8 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     let mut rx = state.tx.subscribe();
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await;
+    let mut last_pong = tokio::time::Instant::now();
+    let mut sent: u64 = 0;
 
     let mut skip: Option<PlayKey> = None;
     let replay = state
@@ -115,69 +184,82 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
         .await
         .as_ref()
         .map(|lp| (lp.event.key(), lp.now_playing_frame.clone()));
-    if let Some((key, frame)) = replay {
-        if send_frame(&mut socket, &frame).await.is_err() {
-            m.connections.add(-1, &[]);
-            m.session_duration
-                .record(connected_at.elapsed().as_secs_f64(), &[]);
-            return;
+    let reason = 'session: {
+        if let Some((key, frame)) = replay {
+            if send_frame(&mut socket, &frame).await.is_err() {
+                break 'session CloseReason::SendError;
+            }
+            m.sent.add(1, &[]);
+            sent += 1;
+            skip = Some(key);
         }
-        m.sent.add(1, &[]);
-        skip = Some(key);
-    }
 
-    loop {
-        tokio::select! {
-            received = rx.recv() => match received {
-                Ok(frame) => {
-                    if should_skip(&mut skip, frame.kind, &frame.key) {
-                        continue;
-                    }
-                    if send_frame(&mut socket, &frame.bytes).await.is_err() {
-                        break;
-                    }
-                    m.sent.add(1, &[]);
-                }
-                Err(RecvError::Lagged(skipped)) => {
-                    m.lagged.add(1, &[]);
-                    warn!("ws client lagged, skipped {skipped} messages; resyncing");
-                    let resync = state
-                        .last_play
-                        .read()
-                        .await
-                        .as_ref()
-                        .map(|lp| (lp.event.key(), lp.now_playing_frame.clone()));
-                    if let Some((key, frame)) = resync {
-                        if send_frame(&mut socket, &frame).await.is_err() {
-                            break;
+        loop {
+            tokio::select! {
+                received = rx.recv() => match received {
+                    Ok(frame) => {
+                        if should_skip(&mut skip, frame.kind, &frame.key) {
+                            continue;
+                        }
+                        if send_frame(&mut socket, &frame.bytes).await.is_err() {
+                            break 'session CloseReason::SendError;
                         }
                         m.sent.add(1, &[]);
-                        skip = Some(key);
+                        sent += 1;
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        m.lagged.add(1, &[]);
+                        warn!("ws client lagged, skipped {skipped} messages; resyncing");
+                        let resync = state
+                            .last_play
+                            .read()
+                            .await
+                            .as_ref()
+                            .map(|lp| (lp.event.key(), lp.now_playing_frame.clone()));
+                        if let Some((key, frame)) = resync {
+                            if send_frame(&mut socket, &frame).await.is_err() {
+                                break 'session CloseReason::SendError;
+                            }
+                            m.sent.add(1, &[]);
+                            sent += 1;
+                            skip = Some(key);
+                        }
+                    }
+                    Err(RecvError::Closed) => break 'session CloseReason::ServerShutdown,
+                },
+                _ = keepalive.tick() => {
+                    if last_pong.elapsed() > PONG_TIMEOUT {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break 'session CloseReason::PongTimeout;
+                    }
+                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                        break 'session CloseReason::SendError;
                     }
                 }
-                Err(RecvError::Closed) => break,
-            },
-            _ = keepalive.tick() => {
-                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
-                    break;
-                }
+                incoming = socket.recv() => match incoming {
+                    Some(Ok(Message::Close(_))) | None => break 'session CloseReason::ClientClose,
+                    Some(Ok(Message::Pong(_))) => last_pong = tokio::time::Instant::now(),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        debug!("ws receive error: {e}");
+                        break 'session CloseReason::ClientClose;
+                    }
+                },
             }
-            incoming = socket.recv() => match incoming {
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
-                Some(Err(e)) => {
-                    debug!("ws receive error: {e}");
-                    break;
-                }
-            },
         }
-    }
+    };
 
+    let duration = connected_at.elapsed();
     m.connections.add(-1, &[]);
-    m.session_duration
-        .record(connected_at.elapsed().as_secs_f64(), &[]);
+    m.session_duration.record(duration.as_secs_f64(), &[]);
+    let span = tracing::Span::current();
+    span.record("close.reason", reason.as_str());
+    span.record("messages.sent", sent);
+    span.record("session.duration_s", duration.as_secs());
     info!(
-        session_duration_s = connected_at.elapsed().as_secs(),
+        close.reason = reason.as_str(),
+        messages.sent = sent,
+        session_duration_s = duration.as_secs(),
         "ws client disconnected"
     );
 }

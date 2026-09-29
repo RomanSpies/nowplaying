@@ -46,11 +46,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 /// Wires DB, Spotify task and web server together and supervises shutdown.
+/// The now-playing cache is seeded from the latest persisted play before
+/// either task starts, so the widget has something to show immediately.
 /// Both tasks are expected to run forever — an early exit is fatal and hands
 /// recovery to systemd, after signalling the surviving task to stop cleanly.
 /// Shutdown joins both tasks instead of sleeping a fixed grace period: the
-/// timeouts cover the spotify task's 5s Spirc drain and the server's 5s
-/// graceful window; anything slower is abandoned with a warning.
+/// spotify timeout covers an in-flight metadata fetch (bounded at 3s) plus
+/// the 5s Spirc drain, the server's the 5s graceful window; anything slower
+/// is abandoned with a warning.
 async fn run_inner(cfg: Config) -> anyhow::Result<()> {
     let database_url = cfg
         .database_url
@@ -61,6 +64,11 @@ async fn run_inner(cfg: Config) -> anyhow::Result<()> {
         .await
         .context("connecting to Postgres")?;
     let state = AppState::new(cfg, pool);
+    match db::latest_play(&state.db).await {
+        Ok(Some(event)) => state.hydrate(event).await,
+        Ok(None) => {}
+        Err(e) => warn!("seeding now-playing from the database failed: {e}"),
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut spotify_task = spotify::spawn(state.clone(), shutdown_rx);
@@ -89,7 +97,7 @@ async fn run_inner(cfg: Config) -> anyhow::Result<()> {
     let _ = shutdown_tx.send(true);
     server_handle.graceful_shutdown(Some(Duration::from_secs(5)));
     let (spotify_res, server_res) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(8), &mut spotify_task),
+        tokio::time::timeout(Duration::from_secs(10), &mut spotify_task),
         tokio::time::timeout(Duration::from_secs(6), &mut server_task),
     );
     for (name, task, res) in [

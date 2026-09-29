@@ -23,6 +23,12 @@ fn test_state() -> AppState {
 /// acquire timeout keeps the DB-down tests from sitting in sqlx's default
 /// 30s wait before /healthz and /api/top report the failure.
 fn test_state_with_origins(origins: &str) -> AppState {
+    test_state_with(origins, 1000, 8)
+}
+
+fn test_state_with(origins: &str, max_connections: usize, max_per_ip: usize) -> AppState {
+    let max_connections = max_connections.to_string();
+    let max_per_ip = max_per_ip.to_string();
     let cfg = Config::parse_from([
         "nowplaying",
         "--bind-addr",
@@ -41,6 +47,10 @@ fn test_state_with_origins(origins: &str) -> AppState {
         "30000",
         "--top-default-limit",
         "10",
+        "--ws-max-connections",
+        &max_connections,
+        "--ws-max-per-ip",
+        &max_per_ip,
         "--log-filter",
         "info",
     ]);
@@ -71,7 +81,8 @@ fn play(title: &str) -> PlayEvent {
     let base: chrono::DateTime<chrono::Utc> = "2026-07-28T12:00:00Z".parse().unwrap();
     PlayEvent {
         track_id: "4uLU6hMCjMI75M1A2tKUQC".into(),
-        track_url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into(),
+        kind: nowplaying::events::MediaKind::Track,
+        track_url: Some("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into()),
         title: title.into(),
         artists: vec!["Rick Astley".into()],
         album: "Whenever You Need Somebody".into(),
@@ -79,6 +90,7 @@ fn play(title: &str) -> PlayEvent {
         duration_ms: 213_000,
         started_at: base + chrono::Duration::seconds(offset),
         lyrics: None,
+        metadata_source: nowplaying::events::MetadataSource::Fetch,
     }
 }
 
@@ -357,7 +369,7 @@ async fn ws_clients_receive_state_frames() {
     assert_eq!(replay["playback"]["state"], "playing");
 
     state
-        .publish_state("4uLU6hMCjMI75M1A2tKUQC".into(), paused_at(83_000))
+        .publish_state("4uLU6hMCjMI75M1A2tKUQC", paused_at(83_000))
         .await;
     let msg = recv_json(&mut ws).await;
     assert_eq!(msg["type"], "state");
@@ -376,7 +388,7 @@ async fn replay_and_api_reflect_state_published_after_the_play() {
 
     state.publish_play(play("PauseMe"), playing_now()).await;
     state
-        .publish_state("4uLU6hMCjMI75M1A2tKUQC".into(), paused_at(83_000))
+        .publish_state("4uLU6hMCjMI75M1A2tKUQC", paused_at(83_000))
         .await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -442,5 +454,112 @@ async fn lyrics_ride_replay_and_api_when_present() {
     assert!(
         msg.get("lyrics").is_none(),
         "absent lyrics must omit the field"
+    );
+}
+
+async fn ws_as(
+    addr: SocketAddr,
+    forwarded_for: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Forwarded-For", forwarded_for.parse().unwrap());
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+fn rejected_with(result: Result<impl Sized, tokio_tungstenite::tungstenite::Error>) -> u16 {
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(other) => panic!("expected an HTTP rejection, got {other:?}"),
+        Ok(_) => panic!("expected an HTTP rejection, got an upgrade"),
+    }
+}
+
+/// One visitor address may hold only `--ws-max-per-ip` sessions (429
+/// beyond); other addresses are unaffected, and a closed session frees its
+/// slot again.
+#[tokio::test]
+async fn ws_per_ip_limit_rejects_with_429_and_frees_on_close() {
+    let addr = spawn_server(test_state_with("https://rospies.dev", 100, 2)).await;
+    let mut first = ws_as(addr, "198.51.100.7").await.unwrap();
+    let _second = ws_as(addr, "198.51.100.7").await.unwrap();
+    assert_eq!(rejected_with(ws_as(addr, "198.51.100.7").await), 429);
+    let _other = ws_as(addr, "198.51.100.8").await.unwrap();
+
+    first.close(None).await.unwrap();
+    let freed = async {
+        loop {
+            if ws_as(addr, "198.51.100.7").await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), freed)
+        .await
+        .expect("closed session must release its slot");
+}
+
+#[tokio::test]
+async fn ws_global_limit_rejects_with_503() {
+    let addr = spawn_server(test_state_with("https://rospies.dev", 1, 8)).await;
+    let _held = ws_as(addr, "198.51.100.7").await.unwrap();
+    assert_eq!(rejected_with(ws_as(addr, "198.51.100.8").await), 503);
+}
+
+/// Clients have nothing to say; an oversized inbound message ends the
+/// session instead of being buffered.
+#[tokio::test]
+async fn oversized_inbound_message_closes_the_session() {
+    use futures_util::SinkExt;
+
+    let addr = spawn_server(test_state()).await;
+    let mut ws = ws_as(addr, "198.51.100.7").await.unwrap();
+    ws.send(Message::Text("x".repeat(64 * 1024).into()))
+        .await
+        .unwrap();
+    let ended = async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), ended)
+        .await
+        .expect("server must close the session");
+}
+
+/// Invariant: `state` frames only ever refer to the cached play — a state
+/// for any other track is refused and nothing is broadcast.
+#[tokio::test]
+async fn state_for_an_uncached_track_is_refused() {
+    let state = test_state();
+    let mut rx = state.tx.subscribe();
+    assert!(
+        !state
+            .publish_state("3dxiWIBVJRlqh9xk144rf4", paused_at(1_000))
+            .await
+    );
+    state.publish_play(play("Cached"), playing_now()).await;
+    rx.try_recv().unwrap();
+    assert!(
+        !state
+            .publish_state("3dxiWIBVJRlqh9xk144rf4", paused_at(1_000))
+            .await
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(
+        state
+            .publish_state("4uLU6hMCjMI75M1A2tKUQC", paused_at(1_000))
+            .await
     );
 }

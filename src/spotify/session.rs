@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use librespot::connect::ConnectConfig;
 use librespot::core::authentication::Credentials;
 use librespot::core::cache::Cache;
@@ -41,6 +41,31 @@ pub fn session_config(cfg: &Config) -> anyhow::Result<SessionConfig> {
     Ok(session_config)
 }
 
+/// Where librespot's `Cache` keeps the reusable credentials.
+pub fn credentials_path(cfg: &Config) -> PathBuf {
+    cfg.cache_dir.join("credentials.json")
+}
+
+/// The cache holds no usable credentials: absent, or unreadable (e.g. a
+/// half-written file while `--login` runs). Treated like rejected
+/// credentials — the service parks until the file changes.
+#[derive(Debug)]
+pub struct MissingCredentials {
+    pub cache_dir: PathBuf,
+}
+
+impl std::fmt::Display for MissingCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no usable cached Spotify credentials in {} — run `nowplaying --login` once",
+            self.cache_dir.display()
+        )
+    }
+}
+
+impl std::error::Error for MissingCredentials {}
+
 pub fn open_cache(cfg: &Config) -> anyhow::Result<Cache> {
     Cache::new(
         Some(cfg.cache_dir.as_path()),
@@ -64,10 +89,10 @@ pub struct SessionBundle {
 pub fn build(cfg: &Config) -> anyhow::Result<SessionBundle> {
     let cache = open_cache(cfg)?;
     let Some(credentials) = cache.credentials() else {
-        bail!(
-            "no cached Spotify credentials in {} — run `nowplaying --login` once",
-            cfg.cache_dir.display()
-        );
+        return Err(MissingCredentials {
+            cache_dir: cfg.cache_dir.clone(),
+        }
+        .into());
     };
 
     let session = Session::new(session_config(cfg)?, Some(cache));

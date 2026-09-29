@@ -1,5 +1,7 @@
 pub mod api;
+pub mod top_cache;
 pub mod ws;
+pub mod ws_limits;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
@@ -24,16 +26,18 @@ use crate::state::AppState;
 
 /// Visitor IP behind the nginx that terminates TLS: the RIGHTMOST
 /// X-Forwarded-For entry is the one our own proxy appended and the only part
-/// of the header a client cannot forge. Falls back to the socket peer for
-/// direct access (e.g. healthz probes against the loopback bind).
+/// of the header a client cannot forge. Only a syntactically valid address
+/// is accepted (it keys the per-IP WebSocket limit, so free-form strings must
+/// not mint fresh buckets); anything else falls back to the socket peer, as
+/// does direct access (e.g. healthz probes against the loopback bind).
 pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
-        .map(|ip| ip.trim().to_owned())
-        .filter(|ip| !ip.is_empty())
-        .or_else(|| peer.map(|p| p.to_string()))
+        .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+        .or(peer)
+        .map(|ip| ip.to_string())
         .unwrap_or_default()
 }
 
@@ -219,6 +223,16 @@ mod tests {
             "6.6.6.6, 198.51.100.9 , 203.0.113.7".parse().unwrap(),
         );
         assert_eq!(client_ip(&h, peer), "203.0.113.7");
+
+        h.insert("x-forwarded-for", "203.0.113.7, not-an-ip".parse().unwrap());
+        assert_eq!(
+            client_ip(&h, peer),
+            "127.0.0.1",
+            "garbage falls back to the peer"
+        );
+
+        h.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
+        assert_eq!(client_ip(&h, peer), "2001:db8::1");
     }
 
     #[test]

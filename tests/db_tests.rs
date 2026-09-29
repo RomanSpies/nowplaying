@@ -13,8 +13,11 @@ use chrono::{Duration, Utc};
 use clap::Parser;
 use nowplaying::config::Config;
 use nowplaying::db;
-use nowplaying::events::PlayEvent;
+use nowplaying::events::{MediaKind, MetadataSource, PlayEvent};
+use nowplaying::spotify::lyrics::LyricsFetch;
+use nowplaying::spotify::metadata::{FetchError, FetchTrack, MetadataResolver, TrackMeta};
 use nowplaying::spotify::pending::{DiscardReason, PendingPersist, PersistFn};
+use nowplaying::spotify::repair_degraded;
 use nowplaying::state::AppState;
 use nowplaying::web;
 use postgresql_archive::configuration::zonky;
@@ -52,6 +55,45 @@ async fn setup() -> (PostgreSQL, PgPool) {
     (pg, pool)
 }
 
+/// Every env-backed field is pinned via CLI flag (CLI beats env in clap).
+fn test_config() -> Config {
+    Config::parse_from([
+        "nowplaying",
+        "--bind-addr",
+        "127.0.0.1:0",
+        "--device-name",
+        "test",
+        "--cache-dir",
+        "/tmp/unused",
+        "--otlp-endpoint",
+        "http://127.0.0.1:1",
+        "--service-name",
+        "test",
+        "--allowed-origins",
+        "https://rospies.dev",
+        "--min-play-ms",
+        "30000",
+        "--top-default-limit",
+        "10",
+        "--ws-max-connections",
+        "1000",
+        "--ws-max-per-ip",
+        "8",
+        "--log-filter",
+        "info",
+    ])
+}
+
+async fn serve(state: AppState) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = web::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    addr
+}
+
 /// Millisecond precision, like production events (derived from cluster
 /// timestamps): raw `Utc::now()` carries nanoseconds, which Postgres
 /// truncates to microseconds and would break round-trip comparisons.
@@ -61,7 +103,8 @@ fn play(track_id: &str, title: &str, artists: &[&str], days_ago: i64) -> PlayEve
         chrono::DateTime::from_timestamp_millis(started_at.timestamp_millis()).unwrap();
     PlayEvent {
         track_id: track_id.into(),
-        track_url: format!("https://open.spotify.com/track/{track_id}"),
+        kind: nowplaying::events::MediaKind::Track,
+        track_url: Some(format!("https://open.spotify.com/track/{track_id}")),
         title: title.into(),
         artists: artists.iter().map(|s| s.to_string()).collect(),
         album: "Album".into(),
@@ -69,6 +112,7 @@ fn play(track_id: &str, title: &str, artists: &[&str], days_ago: i64) -> PlayEve
         duration_ms: 200_000,
         started_at,
         lyrics: None,
+        metadata_source: nowplaying::events::MetadataSource::Fetch,
     }
 }
 
@@ -219,34 +263,8 @@ async fn router_healthz_and_top_limit_clamping() {
         .unwrap();
     }
 
-    let cfg = Config::parse_from([
-        "nowplaying",
-        "--bind-addr",
-        "127.0.0.1:0",
-        "--device-name",
-        "test",
-        "--cache-dir",
-        "/tmp/unused",
-        "--otlp-endpoint",
-        "http://127.0.0.1:1",
-        "--service-name",
-        "test",
-        "--allowed-origins",
-        "https://rospies.dev",
-        "--min-play-ms",
-        "30000",
-        "--top-default-limit",
-        "10",
-        "--log-filter",
-        "info",
-    ]);
-    let state = AppState::new(cfg, pool.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let service = web::router(state).into_make_service_with_connect_info::<SocketAddr>();
-    tokio::spawn(async move {
-        axum::serve(listener, service).await.unwrap();
-    });
+    let state = AppState::new(test_config(), pool.clone());
+    let addr = serve(state.clone()).await;
 
     let health: serde_json::Value = serde_json::from_str(
         &reqwest::get(format!("http://{addr}/healthz"))
@@ -259,6 +277,16 @@ async fn router_healthz_and_top_limit_clamping() {
     .unwrap();
     assert_eq!(health["db_ok"], true);
     assert_eq!(health["spotify_connected"], false);
+    assert_eq!(health["spotify_auth_ok"], true);
+
+    state.set_spotify_auth_failed(true);
+    let resp = reqwest::get(format!("http://{addr}/healthz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "rejected credentials need an operator");
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(body["spotify_auth_ok"], false);
+    state.set_spotify_auth_failed(false);
 
     let songs_at = |query: &'static str| {
         let base = format!("http://{addr}/api/top{query}");
@@ -299,4 +327,220 @@ async fn top_artists_unnests_multi_artist_plays() {
     assert_eq!(top.len(), 2);
     assert_eq!((top[0].artist.as_str(), top[0].plays), ("X", 3));
     assert_eq!((top[1].artist.as_str(), top[1].plays), ("Y", 2));
+}
+
+fn episode(track_id: &str, days_ago: i64) -> PlayEvent {
+    PlayEvent {
+        kind: MediaKind::Episode,
+        track_url: Some(format!("https://open.spotify.com/episode/{track_id}")),
+        artists: vec!["Some Show".into()],
+        ..play(track_id, "Episode", &["Some Show"], days_ago)
+    }
+}
+
+async fn top_json(addr: SocketAddr) -> (serde_json::Value, Option<String>) {
+    let resp = reqwest::get(format!("http://{addr}/api/top"))
+        .await
+        .unwrap();
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let body = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    (body, cache_control)
+}
+
+/// Podcast episodes are persisted but never enter the song or artist lists.
+/// The lists are cached until a persist invalidates them; rows written
+/// behind the cache's back stay invisible until then.
+#[tokio::test]
+async fn top_lists_exclude_episodes_and_cache_until_invalidated() {
+    let (_pg, pool) = setup().await;
+    db::insert_play(&pool, &play("t1", "Song", &["X"], 0))
+        .await
+        .unwrap();
+    for day in 0..3 {
+        db::insert_play(&pool, &episode("e1", day)).await.unwrap();
+    }
+    let state = AppState::new(test_config(), pool.clone());
+    let addr = serve(state.clone()).await;
+
+    let (body, cache_control) = top_json(addr).await;
+    assert_eq!(cache_control.as_deref(), Some("public, max-age=60"));
+    let songs = body["songs"].as_array().unwrap();
+    assert_eq!(songs.len(), 1);
+    assert_eq!(songs[0]["track_id"], "t1");
+    assert_eq!(body["artists"].as_array().unwrap().len(), 1);
+    assert_eq!(body["artists"][0]["artist"], "X");
+
+    db::insert_play(&pool, &play("t2", "Other", &["Y"], 0))
+        .await
+        .unwrap();
+    let (cached, _) = top_json(addr).await;
+    assert_eq!(
+        cached["songs"].as_array().unwrap().len(),
+        1,
+        "served from cache"
+    );
+
+    state.top_cache.invalidate();
+    let (fresh, _) = top_json(addr).await;
+    assert_eq!(fresh["songs"].as_array().unwrap().len(), 2);
+}
+
+/// Startup hydration reads the newest row back with its kind and link.
+#[tokio::test]
+async fn latest_play_round_trips_kind_and_link() {
+    let (_pg, pool) = setup().await;
+    assert!(db::latest_play(&pool).await.unwrap().is_none());
+
+    db::insert_play(&pool, &play("t1", "Older", &["X"], 2))
+        .await
+        .unwrap();
+    db::insert_play(&pool, &episode("e1", 1)).await.unwrap();
+    let latest = db::latest_play(&pool).await.unwrap().unwrap();
+    assert_eq!(latest.track_id, "e1");
+    assert_eq!(latest.kind, MediaKind::Episode);
+    assert_eq!(
+        latest.track_url.as_deref(),
+        Some("https://open.spotify.com/episode/e1")
+    );
+
+    let state = AppState::new(test_config(), pool.clone());
+    state.hydrate(latest).await;
+    let addr = serve(state).await;
+    let body: serde_json::Value = serde_json::from_str(
+        &reqwest::get(format!("http://{addr}/api/now-playing"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["track_id"], "e1");
+    assert_eq!(body["playback"]["state"], "stopped");
+}
+
+/// Answers per `(uri kind, track id)`; anything unlisted is unavailable.
+struct MapFetcher {
+    responses: std::collections::HashMap<(MediaKind, String), Result<TrackMeta, bool>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FetchTrack for MapFetcher {
+    async fn fetch(&self, uri: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = uri.rsplit(':').next().unwrap().to_owned();
+        match self.responses.get(&(kind, id)) {
+            Some(Ok(meta)) => Ok(meta.clone()),
+            Some(Err(true)) => Err(FetchError::NotFound(anyhow::anyhow!("404"))),
+            _ => Err(FetchError::Unavailable(anyhow::anyhow!("down"))),
+        }
+    }
+
+    async fn fetch_lyrics(&self, _track_id: &str) -> LyricsFetch {
+        LyricsFetch::Missing
+    }
+}
+
+fn full(title: &str, artist: &str) -> TrackMeta {
+    TrackMeta {
+        title: title.into(),
+        artists: vec![artist.into()],
+        album: "Full Album".into(),
+        cover_url: None,
+        duration_ms: 123_000,
+        lyrics: None,
+        source: MetadataSource::Fetch,
+    }
+}
+
+fn degraded(track_id: &str) -> PlayEvent {
+    PlayEvent {
+        artists: Vec::new(),
+        metadata_source: MetadataSource::ClusterMap,
+        ..play(track_id, "Map Title", &[], 0)
+    }
+}
+
+async fn row_state(pool: &PgPool, track_id: &str) -> (String, String, Vec<String>) {
+    sqlx::query_as(
+        "SELECT metadata_source, content_type, artists FROM plays WHERE track_id = $1 LIMIT 1",
+    )
+    .bind(track_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Degraded rows are upgraded from a fresh fetch; a "track" Spotify only
+/// knows as an episode (rows from before kinds existed) is re-labelled; one
+/// unknown under both kinds is retired so later passes skip it.
+#[tokio::test]
+async fn repair_upgrades_relabels_and_retires_degraded_rows() {
+    let (_pg, pool) = setup().await;
+    for id in ["trk", "epi", "gone"] {
+        db::insert_play(&pool, &degraded(id)).await.unwrap();
+    }
+    db::insert_play(&pool, &play("ok", "Fine", &["F"], 0))
+        .await
+        .unwrap();
+    let responses = [
+        (
+            (MediaKind::Track, "trk".to_owned()),
+            Ok(full("Real Title", "Real Artist")),
+        ),
+        ((MediaKind::Track, "epi".to_owned()), Err(true)),
+        (
+            (MediaKind::Episode, "epi".to_owned()),
+            Ok(full("Episode 1", "The Show")),
+        ),
+        ((MediaKind::Track, "gone".to_owned()), Err(true)),
+        ((MediaKind::Episode, "gone".to_owned()), Err(true)),
+    ]
+    .into_iter()
+    .collect();
+    let resolver = MetadataResolver::with_fetcher(MapFetcher {
+        responses,
+        calls: Default::default(),
+    });
+
+    let summary = repair_degraded(&pool, &resolver).await;
+    assert_eq!(
+        (
+            summary.checked,
+            summary.repaired,
+            summary.unresolvable,
+            summary.failed
+        ),
+        (3, 2, 1, 0)
+    );
+    assert_eq!(
+        row_state(&pool, "trk").await,
+        ("fetch".into(), "track".into(), vec!["Real Artist".into()])
+    );
+    assert_eq!(
+        row_state(&pool, "epi").await,
+        ("fetch".into(), "episode".into(), vec!["The Show".into()])
+    );
+    assert_eq!(row_state(&pool, "gone").await.0, "unresolvable");
+    assert!(db::degraded_tracks(&pool, 50).await.unwrap().is_empty());
+}
+
+/// Circuit breaker: when Spotify is down, a pass stops after three
+/// consecutive unavailable fetches instead of hammering every track.
+#[tokio::test]
+async fn repair_pass_stops_when_spotify_is_unavailable() {
+    let (_pg, pool) = setup().await;
+    for id in ["a", "b", "c", "d", "e"] {
+        db::insert_play(&pool, &degraded(id)).await.unwrap();
+    }
+    let resolver = MetadataResolver::with_fetcher(MapFetcher {
+        responses: Default::default(),
+        calls: Default::default(),
+    });
+    let summary = repair_degraded(&pool, &resolver).await;
+    assert_eq!((summary.checked, summary.failed), (3, 3));
+    assert_eq!(db::degraded_tracks(&pool, 50).await.unwrap().len(), 5);
 }

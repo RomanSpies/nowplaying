@@ -2,13 +2,83 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-/// A single playback of a track, as pushed to WSS clients and stored in
-/// Postgres. `lyrics` travels only on the wire (never persisted) and is
-/// present iff line-synced, server-side scrambled lyrics exist for the track.
+/// What kind of playable item a play is. Serialized as the `kind` wire field
+/// and stored as `plays.content_type`; only `Track` plays feed the top lists,
+/// and `Local` plays (files on the listener's device) are never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Track,
+    Episode,
+    Local,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Track => "track",
+            Self::Episode => "episode",
+            Self::Local => "local",
+        }
+    }
+
+    /// Inverse of [`MediaKind::as_str`] for the `plays.content_type` column.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "track" => Some(Self::Track),
+            "episode" => Some(Self::Episode),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    /// Public open.spotify.com link for an item id. Local files live only on
+    /// the listener's device and have no public page.
+    pub fn open_url(self, id: &str) -> Option<String> {
+        match self {
+            Self::Track => Some(format!("https://open.spotify.com/track/{id}")),
+            Self::Episode => Some(format!("https://open.spotify.com/episode/{id}")),
+            Self::Local => None,
+        }
+    }
+
+    /// Only these kinds are written to `plays`.
+    pub fn is_persisted(self) -> bool {
+        !matches!(self, Self::Local)
+    }
+}
+
+/// Where a play's metadata came from, stored as `plays.metadata_source`.
+/// `ClusterMap` marks a degraded record (the cluster map carries no artist
+/// names) that the metadata repair pass later upgrades to `Fetch`; `Uri` is
+/// a local file described entirely by its URI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataSource {
+    Fetch,
+    ClusterMap,
+    Uri,
+}
+
+impl MetadataSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::ClusterMap => "cluster_map",
+            Self::Uri => "uri",
+        }
+    }
+}
+
+/// A single playback, as pushed to WSS clients and stored in Postgres.
+/// `lyrics` travels only on the wire (never persisted) and is present iff
+/// line-synced, server-side scrambled lyrics exist for the track;
+/// `metadata_source` is persisted but never sent. `track_url` is `null` on
+/// the wire exactly for local files.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayEvent {
     pub track_id: String,
-    pub track_url: String,
+    pub kind: MediaKind,
+    pub track_url: Option<String>,
     pub title: String,
     pub artists: Vec<String>,
     pub album: String,
@@ -17,6 +87,8 @@ pub struct PlayEvent {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lyrics: Option<Lyrics>,
+    #[serde(skip)]
+    pub metadata_source: MetadataSource,
 }
 
 /// Line-synced, scrambled lyrics: real line structure, lengths and
@@ -61,8 +133,9 @@ pub struct Playback {
     pub as_of: DateTime<Utc>,
 }
 
-/// Which kind of wire frame a broadcast item carries. The WS connect-race
-/// dedupe only ever skips `Play` frames (see web::ws::should_skip).
+/// Which kind of wire frame a broadcast item carries. `Play` covers every
+/// frame with full track metadata (`play` and broadcast `now_playing`); the
+/// WS connect-race dedupe only ever skips those (see web::ws::should_skip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     Play,
@@ -140,7 +213,8 @@ mod tests {
     fn sample() -> PlayEvent {
         PlayEvent {
             track_id: "4uLU6hMCjMI75M1A2tKUQC".into(),
-            track_url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into(),
+            kind: MediaKind::Track,
+            track_url: Some("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into()),
             title: "Never Gonna Give You Up".into(),
             artists: vec!["Rick Astley".into()],
             album: "Whenever You Need Somebody".into(),
@@ -148,6 +222,7 @@ mod tests {
             duration_ms: 213_000,
             started_at: "2026-07-28T12:00:00Z".parse().unwrap(),
             lyrics: None,
+            metadata_source: MetadataSource::Fetch,
         }
     }
 
@@ -175,6 +250,39 @@ mod tests {
         assert_eq!(now["type"], "now_playing");
         assert_eq!(now["duration_ms"], 213_000);
         assert_eq!(now["playback"]["state"], "paused");
+        assert_eq!(now["kind"], "track");
+        assert!(
+            now.get("metadata_source").is_none(),
+            "metadata_source is server-internal"
+        );
+    }
+
+    /// Local files have no public page: the link is an explicit `null`, so
+    /// clients can rely on the key being present.
+    #[test]
+    fn local_play_serializes_null_url() {
+        let local = PlayEvent {
+            kind: MediaKind::Local,
+            track_url: None,
+            ..sample()
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&local.to_ws_bytes(false, sample_playback())).unwrap();
+        assert_eq!(v["kind"], "local");
+        assert!(v["track_url"].is_null());
+    }
+
+    #[test]
+    fn media_kind_links_and_db_round_trip() {
+        assert_eq!(
+            MediaKind::Episode.open_url("abc").as_deref(),
+            Some("https://open.spotify.com/episode/abc")
+        );
+        assert_eq!(MediaKind::Local.open_url("abc"), None);
+        for kind in [MediaKind::Track, MediaKind::Episode, MediaKind::Local] {
+            assert_eq!(MediaKind::from_db(kind.as_str()), Some(kind));
+        }
+        assert_eq!(MediaKind::from_db("ad"), None);
     }
 
     #[test]
