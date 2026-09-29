@@ -5,6 +5,7 @@
 //! stop or track change before the threshold discards the play entirely.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
@@ -26,8 +27,12 @@ pub enum DiscardReason {
     Superseded,
     /// Playback stopped (cluster reported not-playing).
     Stopped,
-    /// The Spotify connection ended (reconnect or shutdown).
+    /// The service shut down before the threshold.
     Disconnected,
+    /// Playback moved into a Spotify private session.
+    Private,
+    /// Playback was transferred to this service's own (silent) device.
+    OwnDevice,
 }
 
 impl DiscardReason {
@@ -36,6 +41,8 @@ impl DiscardReason {
             Self::Superseded => "superseded",
             Self::Stopped => "stopped",
             Self::Disconnected => "disconnected",
+            Self::Private => "private",
+            Self::OwnDevice => "own_device",
         }
     }
 }
@@ -87,18 +94,24 @@ impl ListenClock {
 }
 
 /// A detected play that has not (necessarily) been persisted yet. Owns the
-/// timer task that fires `persist` once enough listening has accumulated.
+/// timer task that hands the play to `persist` once enough listening has
+/// accumulated.
 ///
-/// Timer state invariant: `handle` is `Some` while a timer is armed or has
-/// already fired, `None` while paused before the threshold. Segment durations
-/// are measured with `tokio::time::Instant`, so tests can drive the clock via
-/// `tokio::time::pause`/`advance`.
+/// Timer state invariant: `handle` is `Some` while a timer is armed, `None`
+/// while paused before the threshold. `fired` flips exactly once, when the
+/// timer hands off; the persist itself then runs as a detached task, so no
+/// later pause or discard can abort an insert (or its retries) in flight.
+/// Segment durations are measured with `tokio::time::Instant`, so tests can
+/// drive the clock via `tokio::time::pause`/`advance`.
 pub struct PendingPersist {
     event: PlayEvent,
     clock: ListenClock,
     min_play_ms: u64,
     epoch: tokio::time::Instant,
     handle: Option<JoinHandle<()>>,
+    fired: Arc<AtomicBool>,
+    /// Paused by a lost Spotify connection rather than by the listener.
+    suspended: bool,
     persist: PersistFn,
     discarded: Counter<u64>,
 }
@@ -119,6 +132,8 @@ impl PendingPersist {
             min_play_ms: min_play.as_millis() as u64,
             epoch: tokio::time::Instant::now(),
             handle: None,
+            fired: Arc::new(AtomicBool::new(false)),
+            suspended: false,
             persist,
             discarded,
         };
@@ -132,65 +147,101 @@ impl PendingPersist {
         self.epoch.elapsed().as_millis() as i64
     }
 
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    pub fn track_id(&self) -> &str {
+        &self.event.track_id
+    }
+
     /// Feed the current paused flag from a cluster snapshot. Idempotent, so
     /// it can be called on every same-track update (including seeks, which
     /// keep wall-clock listening running and thus don't touch the clock).
+    /// Returns `true` iff this call resumed a play suspended by
+    /// [`PendingPersist::suspend`].
     ///
     /// The abort/fire race on pause (timer fires between sleep-end and abort)
     /// and the near-zero re-arm on late resume are both absorbed by the
     /// idempotent, replay-guarded insert keyed on (track_id, started_at).
-    /// A fired handle stays in place: it marks the play as persisted, so a
-    /// later resume must not re-arm.
-    pub fn set_paused(&mut self, paused: bool) {
-        if !self.clock.set_playing(!paused, self.now_ms()) {
-            return;
+    /// Once fired, the play is persisted and nothing re-arms.
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        let resumed = !paused && std::mem::take(&mut self.suspended);
+        if resumed {
+            info!(
+                track_id = %self.event.track_id,
+                listened_ms = self.clock.listened_ms(self.now_ms()),
+                remaining_ms = self.clock.remaining_ms(self.min_play_ms, self.now_ms()),
+                "pending play resumed after reconnect"
+            );
+        }
+        if !self.clock.set_playing(!paused, self.now_ms()) || self.fired() {
+            return resumed;
         }
         if paused {
-            if self.handle.as_ref().is_some_and(|h| !h.is_finished())
-                && let Some(h) = self.handle.take()
-            {
+            if let Some(h) = self.handle.take() {
                 h.abort();
             }
         } else if self.handle.is_none() {
             self.arm();
         }
+        resumed
+    }
+
+    /// Hold the countdown while the Spotify connection is down: listening
+    /// during the outage is unknowable and conservatively not counted. The
+    /// next same-track update after the reconnect resumes it.
+    pub fn suspend(&mut self) {
+        if self.fired() {
+            return;
+        }
+        self.set_paused(true);
+        self.suspended = true;
+        info!(
+            track_id = %self.event.track_id,
+            listened_ms = self.clock.listened_ms(self.now_ms()),
+            remaining_ms = self.clock.remaining_ms(self.min_play_ms, self.now_ms()),
+            "pending play suspended by disconnect"
+        );
     }
 
     /// The deadline is fixed at arm time rather than on the spawned task's
     /// first poll: "remaining counts from the arm" must not depend on
     /// scheduler latency, and a lazily created sleep would anchor to whenever
-    /// the task first runs. The task is instrumented with a `play.persist`
-    /// span — `arm` executes inside `cluster.handle_update`, so the deferred
-    /// insert shows up (late) in the trace of the play it belongs to instead
-    /// of as an orphan root span.
+    /// the task first runs. The persist runs under a `play.persist` span —
+    /// `arm` executes inside `cluster.handle_update`, so the deferred insert
+    /// shows up (late) in the trace of the play it belongs to instead of as
+    /// an orphan root span. `persist.attempts` and `outcome` are recorded by
+    /// the persist action.
     fn arm(&mut self) {
         let remaining =
             Duration::from_millis(self.clock.remaining_ms(self.min_play_ms, self.now_ms()));
         let deadline = tokio::time::Instant::now() + remaining;
         let persist = self.persist.clone();
         let event = self.event.clone();
+        let fired = self.fired.clone();
         let span = info_span!(
             "play.persist",
             track_id = %event.track_id,
             remaining_ms = remaining.as_millis() as u64,
+            persist.attempts = tracing::field::Empty,
+            outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
-        self.handle = Some(tokio::spawn(
-            async move {
-                tokio::time::sleep_until(deadline).await;
-                persist(event).await;
-            }
-            .instrument(span),
-        ));
+        self.handle = Some(tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            fired.store(true, Ordering::Release);
+            tokio::spawn(persist(event).instrument(span));
+        }));
     }
 
     /// Drop the play before it qualified. No-op (and no metric) if the timer
-    /// already fired — then the play was persisted, not discarded.
+    /// already fired — then the play is persisted, not discarded.
     pub fn discard(self, reason: DiscardReason) {
+        if self.fired() {
+            return;
+        }
         if let Some(h) = &self.handle {
-            if h.is_finished() {
-                return;
-            }
             h.abort();
         }
         self.discarded
@@ -198,6 +249,7 @@ impl PendingPersist {
         info!(
             track_id = %self.event.track_id,
             reason = reason.as_str(),
+            listened_ms = self.clock.listened_ms(self.now_ms()),
             "discarding unqualified play"
         );
     }
@@ -250,7 +302,8 @@ mod tests {
     fn sample_event() -> PlayEvent {
         PlayEvent {
             track_id: "t".into(),
-            track_url: "https://open.spotify.com/track/t".into(),
+            kind: crate::events::MediaKind::Track,
+            track_url: Some("https://open.spotify.com/track/t".into()),
             title: "T".into(),
             artists: vec!["A".into()],
             album: "Al".into(),
@@ -258,6 +311,7 @@ mod tests {
             duration_ms: 200_000,
             started_at: "2026-07-28T12:00:00Z".parse().unwrap(),
             lyrics: None,
+            metadata_source: crate::events::MetadataSource::Fetch,
         }
     }
 
@@ -361,6 +415,53 @@ mod tests {
         settle().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         p.discard(DiscardReason::Stopped);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A persist still running (e.g. inside its retry backoff) when the
+    /// playback moves on must complete: the discard after firing is a no-op
+    /// and must neither abort the insert nor count as discarded.
+    #[tokio::test(start_paused = true)]
+    async fn discard_after_firing_does_not_abort_a_slow_persist() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let persist: PersistFn = Arc::new(move |_event| {
+            let c = c.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let p = PendingPersist::new(sample_event(), false, MIN_PLAY, persist, discard_counter());
+        tokio::time::advance(Duration::from_millis(30_001)).await;
+        settle().await;
+        p.discard(DiscardReason::Superseded);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        settle().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Reconnect handling: the countdown stops while disconnected and the
+    /// first same-track update afterwards resumes it, reporting the resume
+    /// exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn suspend_holds_listening_until_resumed() {
+        let (persist, count) = counting_persist();
+        let mut p =
+            PendingPersist::new(sample_event(), false, MIN_PLAY, persist, discard_counter());
+        tokio::time::advance(Duration::from_millis(20_000)).await;
+        p.suspend();
+        tokio::time::advance(Duration::from_millis(120_000)).await;
+        settle().await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        assert!(p.set_paused(false), "first resume reports the reconnect");
+        assert!(!p.set_paused(false));
+        tokio::time::advance(Duration::from_millis(9_999)).await;
+        settle().await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        settle().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

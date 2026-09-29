@@ -2,33 +2,41 @@ pub mod cluster;
 pub mod lyrics;
 pub mod metadata;
 pub mod pending;
+pub mod reconnect;
 pub mod session;
 pub mod sink;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use librespot::connect::Spirc;
 use librespot::core::dealer::manager::BoxedStreamResult;
 use librespot::core::dealer::protocol::Message;
+use librespot::core::error::ErrorKind;
 use librespot::protocol::connect::ClusterUpdate;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, ObservableGauge};
+use sqlx::PgPool;
 use tokio::sync::watch;
-use tracing::{Instrument, error, info, info_span, instrument, warn};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::db;
-use crate::events::{PlayEvent, PlaybackState};
+use crate::events::{MediaKind, PlayEvent, PlaybackState};
 use crate::spotify::cluster::{
-    ClusterSnapshot, LiveStateTracker, NewPlay, PlaybackTracker, StatePatch, Suppressed,
+    ClockSample, ClusterSnapshot, LiveStateTracker, NoSnapshot, PlayCause, PlaybackTracker,
+    ServerClock, StatePatch, Suppressed,
 };
-use crate::spotify::metadata::{FetchTrack, MetadataResolver};
+use crate::spotify::metadata::{FetchTrack, MetadataResolver, TrackMeta, media_link};
 use crate::spotify::pending::{DiscardReason, PendingPersist, PersistFn};
+use crate::spotify::reconnect::ReconnectBudget;
+use crate::spotify::session::MissingCredentials;
 use crate::state::AppState;
 
 const CLUSTER_URI: &str = "hm://connect-state/v1/cluster";
@@ -37,6 +45,18 @@ const RECONNECT_WINDOW: Duration = Duration::from_secs(600);
 /// Reconnect replay guard: a play of the same track starting within this
 /// window of the last persisted row is considered the same playback.
 const REPLAY_GUARD_SECS: f64 = 10.0;
+/// Insert attempts per qualified play; backoff doubles from
+/// [`PERSIST_BACKOFF`] (1+2+4+8 s ≈ 15 s of Postgres outage tolerated).
+const PERSIST_ATTEMPTS: u32 = 5;
+const PERSIST_BACKOFF: Duration = Duration::from_secs(1);
+/// How often a parked (credential-less) spotify task checks whether the
+/// credentials file changed.
+const CREDENTIALS_POLL: Duration = Duration::from_secs(60);
+const REPAIR_INTERVAL: Duration = Duration::from_secs(3600);
+const REPAIR_BATCH: i64 = 50;
+/// Consecutive `Unavailable` fetches after which a repair run gives up
+/// (circuit breaker: Spotify is having trouble, retry next interval).
+const REPAIR_MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 struct Metrics {
     plays: Counter<u64>,
@@ -111,87 +131,218 @@ pub fn spawn(
     tokio::spawn(run(state, shutdown))
 }
 
-/// Supervision loop: (re)build the whole session/Spirc/dealer stack on any
-/// failure, mirroring the librespot CLI's rate-limited reconnect behaviour.
-/// A connection that survives [`RECONNECT_WINDOW`] resets the failure budget
-/// and the backoff; exceeding [`MAX_RECONNECTS`] within the window exits the
-/// process and hands recovery to systemd.
+/// Control over this service's own Connect device. Split out so
+/// `handle_update` is testable without a live `Spirc`.
+pub trait DeviceControl: Send + Sync {
+    fn device_id(&self) -> &str;
+    /// Give up the active-device role and pause: someone picked this silent
+    /// device as the playback target.
+    fn release(&self);
+}
+
+struct SpircDevice<'a> {
+    spirc: &'a Spirc,
+    device_id: String,
+}
+
+impl DeviceControl for SpircDevice<'_> {
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn release(&self) {
+        if let Err(e) = self.spirc.disconnect(true) {
+            warn!("releasing own device failed: {e}");
+        }
+    }
+}
+
+/// Why a connection attempt or lifetime ended with an error. `Auth` needs an
+/// operator (`nowplaying --login`), so it is never retried blindly.
+enum ConnectError {
+    Auth(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+impl ConnectError {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Auth(_) => "auth",
+            Self::Transient(_) => "transient",
+        }
+    }
+}
+
+/// Aborts the wrapped task when dropped, tying its lifetime to a scope.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Owns the per-process playback [`Pipeline`] across reconnects and discards
+/// a still-unqualified play exactly once, when the task ends.
 async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
     let metrics = Metrics::new(&state);
-    let mut recent_failures: Vec<tokio::time::Instant> = Vec::new();
-    let mut backoff = Duration::from_secs(1);
+    let mut pipeline = Pipeline::default();
+    let result = supervise(&state, &metrics, &mut pipeline, &mut shutdown).await;
+    if let Some(p) = pipeline.pending.take() {
+        p.discard(DiscardReason::Disconnected);
+    }
+    result
+}
+
+/// Supervision loop: (re)build the whole session/Spirc/dealer stack on any
+/// transient failure, rate-limited by [`ReconnectBudget`]; exhausting it
+/// exits the process and hands recovery to systemd. Credential problems do
+/// not burn the budget — the task parks until the credentials file changes,
+/// since restarting cannot fix them.
+///
+/// A pending play is suspended (not discarded) whenever a connection ends:
+/// the reconnect's first update usually re-observes the same track and
+/// resumes its listening countdown.
+async fn supervise(
+    state: &AppState,
+    metrics: &Metrics,
+    pipeline: &mut Pipeline,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut budget = ReconnectBudget::new(MAX_RECONNECTS, RECONNECT_WINDOW);
+    let mut attempt: u64 = 0;
 
     loop {
-        let started = tokio::time::Instant::now();
-        match run_once(&state, &metrics, &mut shutdown).await {
+        attempt += 1;
+        let started = Instant::now();
+        let outcome = run_once(state, metrics, pipeline, shutdown, attempt).await;
+        state.set_spotify_connected(false);
+        if let Some(p) = pipeline.pending.as_mut() {
+            p.suspend();
+        }
+
+        match outcome {
             Ok(()) => {
                 info!("spotify task shutting down");
                 return Ok(());
             }
-            Err(e) => {
-                state.set_spotify_connected(false);
-                warn!("spotify connection failed: {e:#}");
+            Err(ConnectError::Auth(e)) => match park_on_auth_failure(state, shutdown, &e).await {
+                Parked::Shutdown => return Ok(()),
+                Parked::CredentialsChanged => {
+                    budget.reset();
+                    attempt = 0;
+                }
+            },
+            Err(ConnectError::Transient(e)) => {
+                warn!(error = %format!("{e:#}"), "spotify connection failed");
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                let backoff = budget.on_failure(Instant::now(), started.elapsed())?;
+                metrics.reconnects.add(1, &[]);
+                info!(
+                    reconnect.backoff_ms = backoff.as_millis() as u64,
+                    reconnect.budget_remaining = budget.remaining(),
+                    "reconnecting to Spotify in {backoff:?}"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.changed() => return Ok(()),
+                }
             }
         }
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-
-        if started.elapsed() > RECONNECT_WINDOW {
-            recent_failures.clear();
-            backoff = Duration::from_secs(1);
-        }
-        let now = tokio::time::Instant::now();
-        recent_failures.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
-        recent_failures.push(now);
-        if recent_failures.len() > MAX_RECONNECTS {
-            bail!(
-                "spotify reconnected too often ({MAX_RECONNECTS}x within {RECONNECT_WINDOW:?}); giving up"
-            );
-        }
-
-        metrics.reconnects.add(1, &[]);
-        info!("reconnecting to Spotify in {backoff:?}");
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
-            _ = shutdown.changed() => return Ok(()),
-        }
-        backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
 
+enum Parked {
+    Shutdown,
+    CredentialsChanged,
+}
+
+fn modified(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Wait out a credential failure: flag it for /healthz, then poll the
+/// credentials file's mtime until an operator replaces it (or shutdown).
+/// A half-written file simply fails the next attempt and parks again.
+async fn park_on_auth_failure(
+    state: &AppState,
+    shutdown: &mut watch::Receiver<bool>,
+    cause: &anyhow::Error,
+) -> Parked {
+    state.set_spotify_auth_failed(true);
+    let path = session::credentials_path(&state.cfg);
+    let span = info_span!("spotify.auth_parked", credentials.path = %path.display());
+    async {
+        error!(
+            error = %format!("{cause:#}"),
+            "Spotify credentials missing or rejected; parked until they change — run `nowplaying --login`"
+        );
+        let baseline = modified(&path);
+        let mut poll = tokio::time::interval(CREDENTIALS_POLL);
+        poll.tick().await;
+        loop {
+            if *shutdown.borrow() {
+                return Parked::Shutdown;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return Parked::Shutdown,
+                _ = poll.tick() => {
+                    if modified(&path) != baseline {
+                        info!("credentials_changed: retrying Spotify login");
+                        return Parked::CredentialsChanged;
+                    }
+                }
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
 /// One connection lifetime. Returns Ok(()) only on requested shutdown; any
-/// other exit is an error that triggers a reconnect.
+/// other exit is an error that triggers a reconnect (or parking, for
+/// credential failures).
 ///
 /// The setup order is load-bearing: the cluster subscription is registered
 /// **before** `Spirc::new`, because librespot connects the session only once
 /// all dealer listeners are in place (subscriptions to the same URI fan out —
 /// each subscriber gets its own copy). Session build, subscription and Spirc
 /// registration run under a single `spotify.connect` span so slow or failed
-/// connects are visible as one unit.
+/// connects are visible as one unit. A login rejected by the access point
+/// surfaces as `ErrorKind::PermissionDenied` from `Spirc::new`.
 ///
-/// Every select arm exits by breaking out of the loop, funnelling into the
-/// single cleanup point that discards a pending, not-yet-fired persist: a
-/// timer outliving the connection would double-persist once the reconnect
-/// re-detects the current track.
+/// The metadata repair pass runs as a sibling task bound to this connection
+/// (it needs the session) and never blocks cluster handling.
 async fn run_once(
     state: &AppState,
     metrics: &Metrics,
+    pipeline: &mut Pipeline,
     shutdown: &mut watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    attempt: u64,
+) -> Result<(), ConnectError> {
     let connect_span = info_span!(
         "spotify.connect",
         device_name = %state.cfg.device_name,
+        reconnect.attempt = attempt,
+        connect.error_kind = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
     );
     let connected = async {
-        let bundle = session::build(&state.cfg)?;
+        let bundle = session::build(&state.cfg).map_err(|e| {
+            if e.is::<MissingCredentials>() {
+                ConnectError::Auth(e)
+            } else {
+                ConnectError::Transient(e)
+            }
+        })?;
         let session = bundle.session.clone();
 
         let cluster_stream: BoxedStreamResult<ClusterUpdate> = session
             .dealer()
             .listen_for(CLUSTER_URI, Message::from_raw)
-            .map_err(|e| anyhow::anyhow!("subscribing to cluster updates: {e}"))?;
+            .map_err(|e| ConnectError::Transient(anyhow!("subscribing to cluster updates: {e}")))?;
 
         let (spirc, spirc_task) = Spirc::new(
             bundle.connect_config,
@@ -201,32 +352,52 @@ async fn run_once(
             bundle.mixer,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("starting Spirc: {e}"))?;
-        anyhow::Ok((session, cluster_stream, spirc, spirc_task))
+        .map_err(|e| {
+            let rejected = e.kind == ErrorKind::PermissionDenied;
+            let err = anyhow!("starting Spirc: {e}");
+            if rejected {
+                ConnectError::Auth(err)
+            } else {
+                ConnectError::Transient(err)
+            }
+        })?;
+        Ok::<_, ConnectError>((session, cluster_stream, spirc, spirc_task))
     }
     .instrument(connect_span.clone())
     .await;
     let (session, mut cluster_stream, spirc, spirc_task) = match connected {
         Ok(parts) => parts,
         Err(e) => {
+            connect_span.record("connect.error_kind", e.kind());
             connect_span.record("otel.status_code", "ERROR");
             return Err(e);
         }
     };
     let mut spirc_task = std::pin::pin!(spirc_task);
 
+    if state.is_spotify_auth_failed() {
+        info!("auth_recovered: Spotify accepted the credentials again");
+        state.set_spotify_auth_failed(false);
+    }
     state.set_spotify_connected(true);
     info!(device_name = %state.cfg.device_name, "connected as Spotify Connect device");
 
-    let resolver = MetadataResolver::new(session.clone());
+    let device = SpircDevice {
+        spirc: &spirc,
+        device_id: session.device_id().to_owned(),
+    };
+    let resolver = Arc::new(MetadataResolver::new(session.clone()));
     let persist = make_persist_fn(state, metrics);
-    let mut pipeline = Pipeline::default();
+    let _repair = AbortOnDrop(tokio::spawn(repair_loop(
+        state.db.clone(),
+        resolver.clone(),
+    )));
     let mut invalid_check = tokio::time::interval(Duration::from_secs(5));
 
-    let result = loop {
+    loop {
         tokio::select! {
             _ = &mut spirc_task => {
-                break Err(anyhow!("spirc task ended unexpectedly"));
+                break Err(ConnectError::Transient(anyhow!("spirc task ended unexpectedly")));
             }
             _ = shutdown.changed() => {
                 let _ = spirc.shutdown();
@@ -236,55 +407,64 @@ async fn run_once(
             _ = invalid_check.tick() => {
                 if session.is_invalid() {
                     metrics.session_invalid.add(1, &[]);
-                    break Err(anyhow!("session invalidated"));
+                    break Err(ConnectError::Transient(anyhow!("session invalidated")));
                 }
             }
             item = cluster_stream.next() => {
                 match item {
-                    None => break Err(anyhow!("cluster update stream ended")),
+                    None => break Err(ConnectError::Transient(anyhow!("cluster update stream ended"))),
                     Some(Err(e)) => warn!("undecodable cluster update: {e}"),
                     Some(Ok(update)) => {
-                        handle_update(state, metrics, &resolver, &mut pipeline, &persist, update).await;
+                        handle_update(state, metrics, &resolver, pipeline, &persist, &device, update)
+                            .await;
                     }
                 }
             }
         }
-    };
-
-    if let Some(p) = pipeline.pending.take() {
-        p.discard(DiscardReason::Disconnected);
     }
-    result
 }
 
-/// Per-connection playback pipeline state, rebuilt fresh on every
-/// (re)connect: the first update then re-detects the current play and
-/// re-publishes the live state once — idempotent for both DB and clients.
+/// Playback pipeline state. Owned by the supervision loop and kept across
+/// reconnects: after a reconnect the tracker recognises the still-running
+/// track (no duplicate play, no duplicate frames), and a suspended pending
+/// play resumes its countdown.
 #[derive(Default)]
 struct Pipeline {
     tracker: PlaybackTracker,
     live: LiveStateTracker,
     pending: Option<PendingPersist>,
+    clock: ServerClock,
+    /// Whether the last update had this service's own device active, so the
+    /// device is released once per activation, not on every update.
+    own_device_active: bool,
 }
 
 /// Single entry point for every dealer cluster update; scrobbling and
 /// live-state replication both branch off here.
 ///
-/// A new play supersedes any not-yet-qualified pending persist (skips below
-/// the listen threshold never reach the database) and carries its playback
-/// state inside the `play` frame, computed before the metadata fetch so its
-/// latency cannot skew the position. Updates suppressed for scrobbling —
-/// pause/resume/seek/stop, including trackless `no_track` updates — still
-/// feed the [`LiveStateTracker`] and become `state` frames. `pending` always
-/// belongs to the current track: a new track replaces it, a metadata failure
-/// clears it.
+/// Time: the local clock is corrected onto Spotify's server clock
+/// ([`ServerClock`]) before any extrapolation. Then, in order:
+/// - no usable snapshot (no track, or an unsupported item such as an ad):
+///   the pending play is *held* (paused, not discarded) and the last known
+///   track is reported stopped;
+/// - own device active or private session: nothing about the item is
+///   looked at or published — the pending play is discarded, the tracker
+///   forgets the playback, and the last *public* track is reported stopped.
+///   Taking over the own (silent) device is additionally released once;
+/// - otherwise the [`PlaybackTracker`] decides: a new play (or restart)
+///   supersedes any not-yet-qualified pending persist and carries its
+///   playback state inside the `play` frame, computed before the metadata
+///   fetch so its latency cannot skew the position. Local files are
+///   published but never persisted. Updates suppressed for scrobbling still
+///   feed the [`LiveStateTracker`] and become `state` frames.
 ///
 /// Tracing: one `cluster.handle_update` span per update; declared fields are
-/// recorded as soon as they are known. `outcome` is one of
-/// new_play | no_track | not_playing | same_track | seek | metadata_failed;
-/// `update.reason` is the bare enum variant name (not the protobuf `Result`
-/// wrapper), so span filters match; failures set `otel.status_code = ERROR`
-/// so trace UIs surface them.
+/// recorded as soon as they are known. `outcome` is one of new_play |
+/// restart | no_track | unsupported_media | private_session | own_device |
+/// not_playing | same_track | seek | metadata_failed; `update.reason` is the
+/// bare enum variant name (not the protobuf `Result` wrapper), so span
+/// filters match; failures set `otel.status_code = ERROR` so trace UIs
+/// surface them.
 #[instrument(
     name = "cluster.handle_update",
     skip_all,
@@ -293,9 +473,14 @@ struct Pipeline {
         active_device = tracing::field::Empty,
         track.uri = tracing::field::Empty,
         track.title = tracing::field::Empty,
+        media.kind = tracing::field::Empty,
         playing = tracing::field::Empty,
         paused = tracing::field::Empty,
         position_ms = tracing::field::Empty,
+        private_session = tracing::field::Empty,
+        own_device = tracing::field::Empty,
+        clock.offset_ms = tracing::field::Empty,
+        pending.resumed = tracing::field::Empty,
         outcome = tracing::field::Empty,
         state_published = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
@@ -307,6 +492,7 @@ async fn handle_update<F: FetchTrack>(
     resolver: &MetadataResolver<F>,
     pipeline: &mut Pipeline,
     persist: &PersistFn,
+    device: &dyn DeviceControl,
     update: ClusterUpdate,
 ) {
     let span = tracing::Span::current();
@@ -317,19 +503,67 @@ async fn handle_update<F: FetchTrack>(
         .unwrap_or_else(|n| format!("UNKNOWN({n})"));
     span.record("update.reason", reason.as_str());
 
-    let now_ms = Utc::now().timestamp_millis();
-    let Some(snapshot) = ClusterSnapshot::from_update(update) else {
-        span.record("outcome", "no_track");
-        metrics
-            .suppressed
-            .add(1, &[KeyValue::new("reason", "no_track")]);
+    let local_now_ms = Utc::now().timestamp_millis();
+    if let ClockSample::Rejected(offset_ms) = pipeline
+        .clock
+        .observe(cluster::server_timestamp_ms(&update), local_now_ms)
+    {
+        warn!(offset_ms, "ignoring implausible server clock offset");
+    }
+    let now_ms = pipeline.clock.now_ms(local_now_ms);
+    span.record("clock.offset_ms", pipeline.clock.offset_ms());
+
+    let snapshot = match ClusterSnapshot::from_update(update) {
+        Ok(snapshot) => snapshot,
+        Err(no) => {
+            let label = match &no {
+                NoSnapshot::NoTrack => "no_track",
+                NoSnapshot::Unsupported(kind) => {
+                    span.record("media.kind", kind.as_str());
+                    "unsupported_media"
+                }
+            };
+            span.record("outcome", label);
+            metrics.suppressed.add(1, &[KeyValue::new("reason", label)]);
+            if let Some(p) = pipeline.pending.as_mut() {
+                p.set_paused(true);
+            }
+            if let Some(patch) = pipeline.live.observe(None, now_ms) {
+                publish_live(state, metrics, resolver, None, patch).await;
+            }
+            return;
+        }
+    };
+    let own_device = snapshot.active_device_id == device.device_id();
+    span.record("active_device", snapshot.active_device_id.as_str());
+    span.record("own_device", own_device);
+    span.record("private_session", snapshot.private_session);
+
+    if own_device && !pipeline.own_device_active {
+        warn!("playback was transferred to this silent device; releasing it");
+        device.release();
+    }
+    pipeline.own_device_active = own_device;
+    if own_device || snapshot.private_session {
+        let (label, discard) = if snapshot.private_session {
+            ("private_session", DiscardReason::Private)
+        } else {
+            ("own_device", DiscardReason::OwnDevice)
+        };
+        span.record("outcome", label);
+        metrics.suppressed.add(1, &[KeyValue::new("reason", label)]);
+        pipeline.tracker.clear();
+        if let Some(p) = pipeline.pending.take() {
+            p.discard(discard);
+        }
         if let Some(patch) = pipeline.live.observe(None, now_ms) {
-            publish_state_patch(state, metrics, patch).await;
+            publish_live(state, metrics, resolver, None, patch).await;
         }
         return;
-    };
-    span.record("active_device", snapshot.active_device_id.as_str());
+    }
+
     span.record("track.uri", snapshot.track_uri.as_str());
+    span.record("media.kind", snapshot.kind.as_str());
     span.record("playing", snapshot.is_playing);
     span.record("paused", snapshot.is_paused);
     span.record("position_ms", snapshot.position_ms);
@@ -342,24 +576,52 @@ async fn handle_update<F: FetchTrack>(
             }
             let playback = snapshot.playback(now_ms);
             let _ = pipeline.live.observe(Some(&snapshot), now_ms);
-            match build_event(resolver, &snapshot, &new_play).await {
+            let built = async {
+                let meta = resolver
+                    .resolve(
+                        &new_play.track_uri,
+                        new_play.kind,
+                        &new_play.metadata,
+                        new_play.duration_ms,
+                    )
+                    .await?;
+                play_event(
+                    &new_play.track_uri,
+                    new_play.kind,
+                    meta,
+                    new_play.started_at_ms,
+                    snapshot.duration_ms,
+                )
+            }
+            .await;
+            match built {
                 Ok(event) => {
-                    span.record("outcome", "new_play");
+                    span.record(
+                        "outcome",
+                        match new_play.cause {
+                            PlayCause::NewTrack => "new_play",
+                            PlayCause::Restart => "restart",
+                        },
+                    );
                     span.record("track.title", event.title.as_str());
                     info!(
                         title = %event.title,
                         artists = ?event.artists,
+                        kind = event.kind.as_str(),
                         device = %snapshot.active_device_id,
                         "new play"
                     );
+                    let persisted = event.kind.is_persisted();
                     state.publish_play(event.clone(), playback).await;
-                    pipeline.pending = Some(PendingPersist::new(
-                        event,
-                        snapshot.is_paused,
-                        Duration::from_millis(state.cfg.min_play_ms),
-                        persist.clone(),
-                        metrics.discarded.clone(),
-                    ));
+                    if persisted {
+                        pipeline.pending = Some(PendingPersist::new(
+                            event,
+                            snapshot.is_paused,
+                            Duration::from_millis(state.cfg.min_play_ms),
+                            persist.clone(),
+                            metrics.discarded.clone(),
+                        ));
+                    }
                 }
                 Err(e) => {
                     span.record("outcome", "metadata_failed");
@@ -377,8 +639,10 @@ async fn handle_update<F: FetchTrack>(
                     "not_playing"
                 }
                 Suppressed::SameTrack | Suppressed::Seek => {
-                    if let Some(p) = pipeline.pending.as_mut() {
-                        p.set_paused(snapshot.is_paused);
+                    if let Some(p) = pipeline.pending.as_mut()
+                        && p.set_paused(snapshot.is_paused)
+                    {
+                        span.record("pending.resumed", true);
                     }
                     if reason == Suppressed::Seek {
                         "seek"
@@ -390,17 +654,28 @@ async fn handle_update<F: FetchTrack>(
             span.record("outcome", label);
             metrics.suppressed.add(1, &[KeyValue::new("reason", label)]);
             if let Some(patch) = pipeline.live.observe(Some(&snapshot), now_ms) {
-                publish_state_patch(state, metrics, patch).await;
+                publish_live(state, metrics, resolver, Some(&snapshot), patch).await;
             }
         }
     }
 }
 
-/// Broadcast a live-state patch: metric, correlated log line and the
-/// `state_published` span field, then the actual publish. `track_url` is a
-/// local URI parse (no network).
-async fn publish_state_patch(state: &AppState, metrics: &Metrics, patch: StatePatch) {
-    let track_id = match metadata::track_url(&patch.track_uri) {
+/// Broadcast a live-state patch, upholding the invariant that clients only
+/// ever get `state` frames for the track they hold metadata for (the cached
+/// play). A patch for any other track — e.g. startup into a stopped or
+/// paused track, which never becomes a play — first introduces the track
+/// with a `now_playing` frame built from `snapshot`; without a matching
+/// snapshot or resolvable metadata the patch is dropped. Records metric,
+/// correlated log line and the `state_published` span field only for
+/// frames actually sent.
+async fn publish_live<F: FetchTrack>(
+    state: &AppState,
+    metrics: &Metrics,
+    resolver: &MetadataResolver<F>,
+    snapshot: Option<&ClusterSnapshot>,
+    patch: StatePatch,
+) {
+    let track_id = match media_link(&patch.track_uri) {
         Ok((id, _)) => id,
         Err(e) => {
             warn!("dropping state update, unparsable track uri: {e:#}");
@@ -412,36 +687,65 @@ async fn publish_state_patch(state: &AppState, metrics: &Metrics, patch: StatePa
         PlaybackState::Paused => "paused",
         PlaybackState::Stopped => "stopped",
     };
-    tracing::Span::current().record("state_published", label);
+
+    let published = if state.publish_state(&track_id, patch.playback).await {
+        label
+    } else {
+        let Some(snap) = snapshot.filter(|s| s.track_uri == patch.track_uri) else {
+            debug!(track_id = %track_id, "dropping state frame for a track without metadata");
+            return;
+        };
+        let event = async {
+            let meta = resolver
+                .resolve(&snap.track_uri, snap.kind, &snap.metadata, snap.duration_ms)
+                .await?;
+            play_event(
+                &snap.track_uri,
+                snap.kind,
+                meta,
+                snap.started_at_ms(),
+                snap.duration_ms,
+            )
+        }
+        .await;
+        match event {
+            Ok(event) => {
+                state.publish_now_playing(event, patch.playback).await;
+                "now_playing"
+            }
+            Err(e) => {
+                debug!(track_id = %track_id, "dropping state frame, metadata unresolvable: {e:#}");
+                return;
+            }
+        }
+    };
+
+    tracing::Span::current().record("state_published", published);
     metrics
         .state_updates
         .add(1, &[KeyValue::new("state", label)]);
     info!(
         track_id = %track_id,
         state = label,
+        frame = published,
         position_ms = patch.playback.position_ms,
         "playback state update"
     );
-    state.publish_state(track_id, patch.playback).await;
 }
 
-async fn build_event<F: FetchTrack>(
-    resolver: &MetadataResolver<F>,
-    snapshot: &ClusterSnapshot,
-    new_play: &NewPlay,
+fn play_event(
+    track_uri: &str,
+    kind: MediaKind,
+    meta: TrackMeta,
+    started_at_ms: i64,
+    duration_hint_ms: i64,
 ) -> anyhow::Result<PlayEvent> {
-    let (track_id, track_url) = metadata::track_url(&new_play.track_uri)?;
-    let meta = resolver
-        .resolve(
-            &new_play.track_uri,
-            &new_play.metadata,
-            new_play.duration_ms,
-        )
-        .await?;
-    let started_at = DateTime::<Utc>::from_timestamp_millis(new_play.started_at_ms)
-        .context("started_at out of range")?;
+    let (track_id, track_url) = media_link(track_uri)?;
+    let started_at =
+        DateTime::<Utc>::from_timestamp_millis(started_at_ms).context("started_at out of range")?;
     Ok(PlayEvent {
         track_id,
+        kind,
         track_url,
         title: meta.title,
         artists: meta.artists,
@@ -450,46 +754,302 @@ async fn build_event<F: FetchTrack>(
         duration_ms: if meta.duration_ms > 0 {
             meta.duration_ms
         } else {
-            snapshot.duration_ms.max(0) as u32
+            duration_hint_ms.max(0) as u32
         },
         started_at,
         lyrics: meta.lyrics,
+        metadata_source: meta.source,
     })
 }
 
+/// Result of [`persist_with_retry`], recorded as the `play.persist` span's
+/// `outcome`.
+#[derive(Debug)]
+enum PersistOutcome<E> {
+    Persisted,
+    /// The replay guard found the play already stored.
+    ReplaySuppressed,
+    Failed(E),
+}
+
+impl<E> PersistOutcome<E> {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::ReplaySuppressed => "replay_suppressed",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Run `insert` up to `attempts` times with doubling backoff from `base`.
+/// Safe to repeat because the insert is idempotent and replay-guarded — a
+/// retry after a commit whose acknowledgement was lost reports
+/// `ReplaySuppressed`, not a duplicate. `on_error` sees every failure with
+/// the backoff before the next attempt (`None` for the final one). Returns
+/// the outcome and the number of attempts made.
+async fn persist_with_retry<E, Op, Fut>(
+    attempts: u32,
+    base: Duration,
+    mut insert: Op,
+    mut on_error: impl FnMut(u32, &E, Option<Duration>),
+) -> (PersistOutcome<E>, u32)
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match insert().await {
+            Ok(true) => return (PersistOutcome::Persisted, attempt),
+            Ok(false) => return (PersistOutcome::ReplaySuppressed, attempt),
+            Err(e) if attempt >= attempts => {
+                on_error(attempt, &e, None);
+                return (PersistOutcome::Failed(e), attempt);
+            }
+            Err(e) => {
+                let backoff = base * 2u32.pow(attempt - 1);
+                on_error(attempt, &e, Some(backoff));
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Build the action `PendingPersist` runs once a play has accumulated enough
-/// listening: a guarded, idempotent insert (see `db::insert_play_guarded`).
+/// listening: a guarded, idempotent insert (see `db::insert_play_guarded`)
+/// with bounded retries, so a short Postgres outage does not lose plays.
 ///
-/// `Ok(false)` means the DB replay guard swallowed a reconnect duplicate —
-/// counted in `plays_replay_suppressed_total`; a rising rate there means
-/// reconnects re-detect running playbacks more often than expected. The
-/// future runs instrumented with the `play.persist` span, which receives
-/// `otel.status_code = ERROR` on insert failure.
+/// `ReplaySuppressed` means the DB replay guard swallowed a reconnect
+/// duplicate — counted in `plays_replay_suppressed_total`; a rising rate
+/// there means reconnects re-detect running playbacks more often than
+/// expected. A successful insert invalidates the top-list cache. The future
+/// runs instrumented with the `play.persist` span: every failed attempt is a
+/// span event, `persist.attempts`/`outcome` are recorded at the end, and a
+/// permanent failure sets `otel.status_code = ERROR` and logs the full play
+/// so it can be restored by hand.
 fn make_persist_fn(state: &AppState, metrics: &Metrics) -> PersistFn {
     let pool = state.db.clone();
+    let top_cache = state.top_cache.clone();
     let persisted = metrics.persisted.clone();
     let replay_suppressed = metrics.replay_suppressed.clone();
     let db_errors = metrics.db_errors.clone();
     Arc::new(move |event: PlayEvent| {
         let pool = pool.clone();
+        let top_cache = top_cache.clone();
         let persisted = persisted.clone();
         let replay_suppressed = replay_suppressed.clone();
         let db_errors = db_errors.clone();
         Box::pin(async move {
-            match db::insert_play_guarded(&pool, &event, REPLAY_GUARD_SECS).await {
-                Ok(true) => persisted.add(1, &[]),
-                Ok(false) => {
+            let (outcome, attempts) = persist_with_retry(
+                PERSIST_ATTEMPTS,
+                PERSIST_BACKOFF,
+                || db::insert_play_guarded(&pool, &event, REPLAY_GUARD_SECS),
+                |attempt, e: &sqlx::Error, backoff| {
+                    db_errors.add(1, &[KeyValue::new("op", "insert_play")]);
+                    if let Some(backoff) = backoff {
+                        warn!(
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %e,
+                            "persisting play failed; retrying"
+                        );
+                    }
+                },
+            )
+            .await;
+            let span = tracing::Span::current();
+            span.record("persist.attempts", attempts);
+            span.record("outcome", outcome.as_str());
+            match outcome {
+                PersistOutcome::Persisted => {
+                    persisted.add(1, &[]);
+                    top_cache.invalidate();
+                }
+                PersistOutcome::ReplaySuppressed => {
                     replay_suppressed.add(1, &[]);
                     info!(track_id = %event.track_id, "duplicate or replayed play suppressed");
                 }
-                Err(e) => {
-                    db_errors.add(1, &[KeyValue::new("op", "insert_play")]);
-                    tracing::Span::current().record("otel.status_code", "ERROR");
-                    error!("persisting play failed: {e}");
+                PersistOutcome::Failed(e) => {
+                    span.record("otel.status_code", "ERROR");
+                    error!(
+                        track_id = %event.track_id,
+                        kind = event.kind.as_str(),
+                        title = %event.title,
+                        artists = ?event.artists,
+                        album = %event.album,
+                        cover_url = ?event.cover_url,
+                        duration_ms = event.duration_ms,
+                        started_at = %event.started_at,
+                        metadata_source = event.metadata_source.as_str(),
+                        attempts,
+                        error = %e,
+                        "persisting play failed permanently; play lost"
+                    );
                 }
             }
         })
     })
+}
+
+/// Repairs degraded rows now (the interval's first tick is immediate) and
+/// then every [`REPAIR_INTERVAL`], for as long as the connection lives.
+async fn repair_loop<F: FetchTrack>(pool: PgPool, resolver: Arc<MetadataResolver<F>>) {
+    let mut interval = tokio::time::interval(REPAIR_INTERVAL);
+    loop {
+        interval.tick().await;
+        repair_degraded(&pool, &resolver).await;
+    }
+}
+
+/// Per-run tally of [`repair_degraded`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RepairSummary {
+    pub checked: usize,
+    pub repaired: usize,
+    pub unresolvable: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairOutcome {
+    Repaired,
+    Unresolvable,
+    Unavailable,
+    DbError,
+}
+
+impl RepairOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Repaired => "repaired",
+            Self::Unresolvable => "unresolvable",
+            Self::Unavailable => "unavailable",
+            Self::DbError => "db_error",
+        }
+    }
+}
+
+/// One repair pass over up to [`REPAIR_BATCH`] degraded tracks: re-fetch the
+/// full record and overwrite the rows. A track stored as `track` that
+/// Spotify does not know as one is retried as an episode (rows from before
+/// media kinds were modelled); unknown under both kinds, it is retired as
+/// `unresolvable`. Gives up for this run after
+/// [`REPAIR_MAX_CONSECUTIVE_FAILURES`] unavailable fetches in a row.
+#[instrument(
+    name = "metadata.repair",
+    skip_all,
+    fields(
+        tracks.checked = tracing::field::Empty,
+        tracks.repaired = tracing::field::Empty,
+        tracks.failed = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+)]
+pub async fn repair_degraded<F: FetchTrack>(
+    pool: &PgPool,
+    resolver: &MetadataResolver<F>,
+) -> RepairSummary {
+    let span = tracing::Span::current();
+    let mut summary = RepairSummary::default();
+    let tracks = match db::degraded_tracks(pool, REPAIR_BATCH).await {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            span.record("otel.status_code", "ERROR");
+            warn!("listing degraded tracks failed: {e}");
+            return summary;
+        }
+    };
+    let mut consecutive_unavailable = 0;
+    for track in &tracks {
+        summary.checked += 1;
+        match repair_track(pool, resolver, track).await {
+            RepairOutcome::Repaired => {
+                summary.repaired += 1;
+                consecutive_unavailable = 0;
+            }
+            RepairOutcome::Unresolvable => {
+                summary.unresolvable += 1;
+                consecutive_unavailable = 0;
+            }
+            RepairOutcome::DbError => summary.failed += 1,
+            RepairOutcome::Unavailable => {
+                summary.failed += 1;
+                consecutive_unavailable += 1;
+                if consecutive_unavailable >= REPAIR_MAX_CONSECUTIVE_FAILURES {
+                    warn!(
+                        consecutive_unavailable,
+                        "metadata repair paused: Spotify unavailable, retrying next interval"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    span.record("tracks.checked", summary.checked);
+    span.record("tracks.repaired", summary.repaired);
+    span.record("tracks.failed", summary.failed);
+    if summary.checked > 0 {
+        info!(
+            checked = summary.checked,
+            repaired = summary.repaired,
+            unresolvable = summary.unresolvable,
+            failed = summary.failed,
+            "metadata repair pass finished"
+        );
+    }
+    summary
+}
+
+#[instrument(
+    name = "metadata.repair_track",
+    skip(pool, resolver, track),
+    fields(
+        track_id = %track.track_id,
+        media.kind = track.kind.as_str(),
+        fetch.timeout = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+)]
+async fn repair_track<F: FetchTrack>(
+    pool: &PgPool,
+    resolver: &MetadataResolver<F>,
+    track: &db::DegradedTrack,
+) -> RepairOutcome {
+    let fetch_as = |kind: MediaKind| async move {
+        let uri = format!("spotify:{}:{}", kind.as_str(), track.track_id);
+        resolver
+            .fetch_fresh(&uri, kind)
+            .await
+            .map(|meta| (kind, meta))
+    };
+    let mut fetched = fetch_as(track.kind).await;
+    if track.kind == MediaKind::Track && fetched.as_ref().is_err_and(|e| e.is_not_found()) {
+        fetched = fetch_as(MediaKind::Episode).await;
+    }
+    let outcome = match fetched {
+        Ok((kind, meta)) => match db::repair_metadata(pool, &track.track_id, kind, &meta).await {
+            Ok(_) => RepairOutcome::Repaired,
+            Err(e) => {
+                warn!("writing repaired metadata failed: {e}");
+                RepairOutcome::DbError
+            }
+        },
+        Err(e) if e.is_not_found() => match db::mark_unresolvable(pool, &track.track_id).await {
+            Ok(_) => RepairOutcome::Unresolvable,
+            Err(e) => {
+                warn!("retiring unresolvable track failed: {e}");
+                RepairOutcome::DbError
+            }
+        },
+        Err(e) => {
+            debug!("repair fetch failed: {e}");
+            RepairOutcome::Unavailable
+        }
+    };
+    tracing::Span::current().record("outcome", outcome.as_str());
+    outcome
 }
 
 /// Integration tests for `handle_update`: the glue between tracker, metadata
@@ -500,6 +1060,7 @@ fn make_persist_fn(state: &AppState, metrics: &Metrics) -> PersistFn {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
 
     use clap::Parser;
     use librespot::protocol::connect::Cluster;
@@ -537,6 +1098,10 @@ mod tests {
             "30000",
             "--top-default-limit",
             "10",
+            "--ws-max-connections",
+            "1000",
+            "--ws-max-per-ip",
+            "8",
             "--log-filter",
             "info",
         ]);
@@ -573,12 +1138,30 @@ mod tests {
         u
     }
 
+    const OWN_DEVICE: &str = "widget-device";
+
+    #[derive(Default)]
+    struct FakeDevice {
+        releases: AtomicUsize,
+    }
+
+    impl DeviceControl for FakeDevice {
+        fn device_id(&self) -> &str {
+            OWN_DEVICE
+        }
+
+        fn release(&self) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// Everything handle_update needs, plus a persist recorder instead of a DB.
     struct Harness {
         state: AppState,
         metrics: Metrics,
         pipeline: Pipeline,
         persist: PersistFn,
+        device: FakeDevice,
         seen: Arc<StdMutex<Vec<String>>>,
     }
 
@@ -599,6 +1182,7 @@ mod tests {
                 metrics,
                 pipeline: Pipeline::default(),
                 persist,
+                device: FakeDevice::default(),
                 seen,
             }
         }
@@ -610,6 +1194,7 @@ mod tests {
                 resolver,
                 &mut self.pipeline,
                 &self.persist,
+                &self.device,
                 u,
             )
             .await;
@@ -831,22 +1416,334 @@ mod tests {
         );
     }
 
-    /// A stopped track never becomes a play, so no fetch is scripted.
+    fn cluster_of(u: &mut ClusterUpdate) -> &mut Cluster {
+        u.cluster.0.as_mut().unwrap()
+    }
+
+    fn clear_metadata(u: &mut ClusterUpdate) {
+        cluster_of(u)
+            .player_state
+            .0
+            .as_mut()
+            .unwrap()
+            .track
+            .0
+            .as_mut()
+            .unwrap()
+            .metadata
+            .clear();
+    }
+
+    fn private(mut u: ClusterUpdate) -> ClusterUpdate {
+        use librespot::protocol::connect::DeviceInfo;
+        cluster_of(&mut u).device.insert(
+            "test-device".to_string(),
+            DeviceInfo {
+                is_private_session: true,
+                ..Default::default()
+            },
+        );
+        u
+    }
+
+    fn on_own_device(mut u: ClusterUpdate) -> ClusterUpdate {
+        cluster_of(&mut u).active_device_id = OWN_DEVICE.to_string();
+        u
+    }
+
+    /// Startup into a stopped track: it never becomes a play, but clients
+    /// must learn its metadata before any state for it — one `now_playing`
+    /// frame (metadata from the cluster-map fallback here), no `state`
+    /// frame, nothing pending.
     #[tokio::test(start_paused = true)]
-    async fn startup_into_stopped_track_emits_single_state_frame() {
+    async fn startup_into_stopped_track_introduces_it_with_now_playing() {
         let mut h = Harness::new();
         let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![]));
         let mut rx = h.state.tx.subscribe();
 
         h.feed(&resolver, update(TRACK_A, 5_000, false, false))
             .await;
-        let frame = rx.try_recv().expect("stopped startup state must broadcast");
-        assert_eq!(frame.kind, FrameKind::State);
+        let frame = rx.try_recv().expect("stopped startup must broadcast");
+        assert_eq!(frame.kind, FrameKind::Play);
         let v = json(&frame);
+        assert_eq!(v["type"], "now_playing");
+        assert_eq!(v["title"], "Map Title");
         assert_eq!(v["playback"]["state"], "stopped");
         assert_eq!(v["track_id"], ID_A);
         assert!(rx.try_recv().is_err(), "exactly one frame");
         assert!(h.pipeline.pending.is_none());
         assert!(h.persisted().is_empty());
+        assert!(h.state.last_play.read().await.is_some());
+    }
+
+    /// No metadata anywhere: clients must not get a `state` frame for a
+    /// track they cannot render.
+    #[tokio::test(start_paused = true)]
+    async fn state_for_an_unresolvable_track_is_dropped() {
+        let mut h = Harness::new();
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![]));
+        let mut rx = h.state.tx.subscribe();
+
+        let mut u = update(TRACK_A, 5_000, false, false);
+        clear_metadata(&mut u);
+        h.feed(&resolver, u).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn private_session_stops_publicly_and_leaks_nothing() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Song A"))]));
+        let mut rx = h.state.tx.subscribe();
+
+        h.feed(&resolver, update(TRACK_A, 0, true, false)).await;
+        rx.try_recv().unwrap();
+
+        h.feed(&resolver, private(update(TRACK_B, 0, true, false)))
+            .await;
+        let frame = rx
+            .try_recv()
+            .expect("public track must be reported stopped");
+        let v = json(&frame);
+        assert_eq!(v["type"], "state");
+        assert_eq!(
+            v["track_id"], ID_A,
+            "the private track id must never appear"
+        );
+        assert_eq!(v["playback"]["state"], "stopped");
+        assert!(h.pipeline.pending.is_none(), "pending play is discarded");
+
+        h.feed(&resolver, private(update(TRACK_B, 5_000, true, false)))
+            .await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(120)).await;
+        settle().await;
+        assert!(h.persisted().is_empty());
+        assert_eq!(
+            resolver_calls(&resolver),
+            1,
+            "no metadata fetch for private items"
+        );
+    }
+
+    fn resolver_calls(resolver: &MetadataResolver<ScriptedFetcher>) -> usize {
+        resolver.fetcher_for_tests().call_count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_device_is_released_once_per_activation() {
+        let mut h = Harness::new();
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![]));
+
+        h.feed(&resolver, on_own_device(update(TRACK_A, 0, true, false)))
+            .await;
+        h.feed(&resolver, on_own_device(update(TRACK_A, 500, true, false)))
+            .await;
+        assert_eq!(h.device.releases.load(Ordering::SeqCst), 1);
+        assert!(h.pipeline.pending.is_none());
+
+        h.feed(&resolver, update(TRACK_A, 1_000, false, false))
+            .await;
+        h.feed(&resolver, on_own_device(update(TRACK_A, 0, true, false)))
+            .await;
+        assert_eq!(h.device.releases.load(Ordering::SeqCst), 2);
+    }
+
+    /// Reconnect: the pipeline survives, the pending play is suspended, and
+    /// the first same-track update after the reconnect resumes the countdown
+    /// — the listening before the disconnect still counts.
+    #[tokio::test(start_paused = true)]
+    async fn pending_play_survives_a_reconnect() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Song A"))]));
+        let mut rx = h.state.tx.subscribe();
+
+        h.feed(&resolver, update(TRACK_A, 0, true, false)).await;
+        rx.try_recv().unwrap();
+        tokio::time::advance(Duration::from_millis(20_000)).await;
+        h.pipeline.pending.as_mut().unwrap().suspend();
+        tokio::time::advance(Duration::from_millis(60_000)).await;
+        settle().await;
+        assert!(h.persisted().is_empty());
+
+        h.feed(&resolver, update(TRACK_A, 80_000, true, false))
+            .await;
+        assert!(
+            !matches!(rx.try_recv(), Ok(f) if f.kind == FrameKind::Play),
+            "the running track must not be announced as a new play"
+        );
+        tokio::time::advance(Duration::from_millis(10_001)).await;
+        settle().await;
+        assert_eq!(h.persisted(), [ID_A.to_string()]);
+    }
+
+    /// Ads and other unsupported items hold (not discard) the pending play;
+    /// the listener returning to the same track continues its countdown.
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_media_holds_the_pending_play() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Song A"))]));
+
+        h.feed(&resolver, update(TRACK_A, 0, true, false)).await;
+        tokio::time::advance(Duration::from_millis(10_000)).await;
+        h.feed(
+            &resolver,
+            update("spotify:ad:5sWHDYs0csV6RS48xBl0tH", 0, true, false),
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(60_000)).await;
+        settle().await;
+        assert!(
+            h.persisted().is_empty(),
+            "no listening accrues during the ad"
+        );
+        assert!(h.pipeline.pending.is_some());
+
+        h.feed(&resolver, update(TRACK_A, 10_000, true, false))
+            .await;
+        tokio::time::advance(Duration::from_millis(20_001)).await;
+        settle().await;
+        assert_eq!(h.persisted(), [ID_A.to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_files_are_published_but_never_persisted() {
+        let mut h = Harness::new();
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![]));
+        let mut rx = h.state.tx.subscribe();
+
+        h.feed(
+            &resolver,
+            update(
+                "spotify:local:Some+Artist:Some+Album:Home+Demo:180",
+                0,
+                true,
+                false,
+            ),
+        )
+        .await;
+        let v = json(&rx.try_recv().expect("local play must broadcast"));
+        assert_eq!(v["kind"], "local");
+        assert_eq!(v["title"], "Home Demo");
+        assert!(v["track_url"].is_null());
+        assert!(h.pipeline.pending.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn episodes_link_to_the_episode_page_and_persist() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Pod"))]));
+        let mut rx = h.state.tx.subscribe();
+
+        h.feed(
+            &resolver,
+            update("spotify:episode:512ojhOuo1ktJprKbVcKyQ", 0, true, false),
+        )
+        .await;
+        let v = json(&rx.try_recv().unwrap());
+        assert_eq!(v["kind"], "episode");
+        assert_eq!(
+            v["track_url"],
+            "https://open.spotify.com/episode/512ojhOuo1ktJprKbVcKyQ"
+        );
+        tokio::time::advance(Duration::from_millis(30_001)).await;
+        settle().await;
+        assert_eq!(h.persisted(), ["512ojhOuo1ktJprKbVcKyQ".to_string()]);
+    }
+
+    /// Server-clock correction: a server clock ahead of ours shifts the
+    /// published `as_of`.
+    #[tokio::test(start_paused = true)]
+    async fn server_clock_offset_shifts_published_timestamps() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Song A"))]));
+        let mut rx = h.state.tx.subscribe();
+
+        let mut u = update(TRACK_A, 0, true, false);
+        cluster_of(&mut u).server_timestamp_ms = Utc::now().timestamp_millis() + 120_000;
+        h.feed(&resolver, u).await;
+        let v = json(&rx.try_recv().unwrap());
+        let as_of: DateTime<Utc> = v["playback"]["as_of"].as_str().unwrap().parse().unwrap();
+        let skew = (as_of - Utc::now()).num_milliseconds();
+        assert!((110_000..=130_000).contains(&skew), "as_of skew {skew} ms");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persist_retries_with_doubling_backoff_then_succeeds() {
+        let calls = AtomicUsize::new(0);
+        let mut backoffs = Vec::new();
+        let started = tokio::time::Instant::now();
+        let (outcome, attempts) = persist_with_retry(
+            5,
+            Duration::from_secs(1),
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err("db down")
+                } else {
+                    Ok(true)
+                }
+            },
+            |_, _, backoff| backoffs.push(backoff),
+        )
+        .await;
+        assert!(matches!(outcome, PersistOutcome::Persisted));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            backoffs,
+            [Some(Duration::from_secs(1)), Some(Duration::from_secs(2))]
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persist_gives_up_after_the_last_attempt() {
+        let mut errors = 0;
+        let (outcome, attempts) = persist_with_retry(
+            3,
+            Duration::from_secs(1),
+            || async { Err::<bool, _>("db down") },
+            |_, _, _| errors += 1,
+        )
+        .await;
+        assert!(matches!(outcome, PersistOutcome::Failed("db down")));
+        assert_eq!((attempts, errors), (3, 3));
+
+        let (outcome, _) = persist_with_retry(
+            3,
+            Duration::from_secs(1),
+            || async { Ok::<_, &str>(false) },
+            |_, _, _| {},
+        )
+        .await;
+        assert!(matches!(outcome, PersistOutcome::ReplaySuppressed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeat_one_restart_is_a_new_play_frame() {
+        let mut h = Harness::new();
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Song A"))]));
+        let mut rx = h.state.tx.subscribe();
+
+        let mut first = update(TRACK_A, 0, true, false);
+        let t0 = Utc::now().timestamp_millis() - 200_000;
+        cluster_of(&mut first)
+            .player_state
+            .0
+            .as_mut()
+            .unwrap()
+            .timestamp = t0;
+        h.feed(&resolver, first).await;
+        rx.try_recv().unwrap();
+
+        h.feed(&resolver, update(TRACK_A, 0, true, false)).await;
+        let frame = rx.try_recv().expect("restart must broadcast a play");
+        assert_eq!(frame.kind, FrameKind::Play);
+        assert_eq!(json(&frame)["type"], "play");
     }
 }

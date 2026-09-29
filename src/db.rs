@@ -10,7 +10,8 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tracing::instrument;
 
-use crate::events::PlayEvent;
+use crate::events::{MediaKind, MetadataSource, PlayEvent};
+use crate::spotify::metadata::TrackMeta;
 
 const POOL_MAX_CONNECTIONS: u32 = 5;
 
@@ -93,8 +94,9 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 pub async fn insert_play(pool: &PgPool, event: &PlayEvent) -> sqlx::Result<bool> {
     timed("insert_play", async {
         let result = sqlx::query(
-        "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at,
+                            content_type, metadata_source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (track_id, started_at) DO NOTHING",
     )
     .bind(&event.track_id)
@@ -104,6 +106,8 @@ pub async fn insert_play(pool: &PgPool, event: &PlayEvent) -> sqlx::Result<bool>
     .bind(&event.cover_url)
     .bind(event.duration_ms as i32)
     .bind(event.started_at)
+    .bind(event.kind.as_str())
+    .bind(event.metadata_source.as_str())
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -123,8 +127,9 @@ pub async fn insert_play_guarded(
 ) -> sqlx::Result<bool> {
     timed("insert_play_guarded", async {
         let result = sqlx::query(
-        "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at)
-         SELECT $1, $2, $3, $4, $5, $6, $7
+        "INSERT INTO plays (track_id, title, album, artists, cover_url, duration_ms, started_at,
+                            content_type, metadata_source)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $9, $10
          WHERE NOT EXISTS (
              SELECT 1 FROM plays
              WHERE track_id = $1
@@ -141,6 +146,8 @@ pub async fn insert_play_guarded(
     .bind(event.duration_ms as i32)
     .bind(event.started_at)
     .bind(guard_secs)
+    .bind(event.kind.as_str())
+    .bind(event.metadata_source.as_str())
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -165,16 +172,17 @@ pub struct TopArtist {
     pub plays: i64,
 }
 
-/// Most-played tracks of the rolling window. The per-track "latest metadata"
-/// lookup uses DISTINCT ON: array_agg over the TEXT[] artists column would
-/// build a 2D array whose indexing yields NULL.
+/// Most-played tracks of the rolling window (podcast episodes excluded). The
+/// per-track "latest metadata" lookup uses DISTINCT ON: array_agg over the
+/// TEXT[] artists column would build a 2D array whose indexing yields NULL.
 #[instrument(skip(pool))]
 pub async fn top_songs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopSong>> {
     timed(
         "top_songs",
         sqlx::query_as(
             "WITH windowed AS (
-             SELECT * FROM plays WHERE started_at >= now() - interval '30 days'
+             SELECT * FROM plays
+             WHERE started_at >= now() - interval '30 days' AND content_type = 'track'
          ),
          counts AS (
              SELECT track_id, count(*) AS plays FROM windowed GROUP BY track_id
@@ -200,6 +208,8 @@ pub async fn top_songs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopSong>> 
     .await
 }
 
+/// Most-played artists of the rolling window, tracks only (an episode's
+/// "artist" is its show).
 #[instrument(skip(pool))]
 pub async fn top_artists(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopArtist>> {
     timed(
@@ -207,7 +217,7 @@ pub async fn top_artists(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopArtis
         sqlx::query_as(
             "SELECT unnest(artists) AS artist, count(*) AS plays
          FROM plays
-         WHERE started_at >= now() - interval '30 days'
+         WHERE started_at >= now() - interval '30 days' AND content_type = 'track'
          GROUP BY artist
          ORDER BY plays DESC, artist
          LIMIT $1",
@@ -215,5 +225,136 @@ pub async fn top_artists(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<TopArtis
         .bind(limit)
         .fetch_all(pool),
     )
+    .await
+}
+
+#[derive(sqlx::FromRow)]
+struct PlayRow {
+    track_id: String,
+    content_type: String,
+    title: String,
+    artists: Vec<String>,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: i32,
+    started_at: chrono::DateTime<chrono::Utc>,
+    metadata_source: String,
+}
+
+/// The most recently started persisted play, for seeding the now-playing
+/// cache at startup. Lyrics are never persisted, so the event carries none.
+#[instrument(skip(pool))]
+pub async fn latest_play(pool: &PgPool) -> sqlx::Result<Option<PlayEvent>> {
+    let row: Option<PlayRow> = timed(
+        "latest_play",
+        sqlx::query_as(
+            "SELECT track_id, content_type, title, artists, album, cover_url, duration_ms,
+                    started_at, metadata_source
+             FROM plays
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )
+        .fetch_optional(pool),
+    )
+    .await?;
+    Ok(row.map(|r| {
+        let kind = MediaKind::from_db(&r.content_type).unwrap_or(MediaKind::Track);
+        PlayEvent {
+            track_url: kind.open_url(&r.track_id),
+            track_id: r.track_id,
+            kind,
+            title: r.title,
+            artists: r.artists,
+            album: r.album,
+            cover_url: r.cover_url,
+            duration_ms: r.duration_ms.max(0) as u32,
+            started_at: r.started_at,
+            lyrics: None,
+            metadata_source: if r.metadata_source == "fetch" {
+                MetadataSource::Fetch
+            } else {
+                MetadataSource::ClusterMap
+            },
+        }
+    }))
+}
+
+/// A track whose persisted rows carry degraded cluster-map metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedTrack {
+    pub track_id: String,
+    pub kind: MediaKind,
+}
+
+/// Distinct degraded tracks awaiting the metadata repair pass.
+#[instrument(skip(pool))]
+pub async fn degraded_tracks(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<DegradedTrack>> {
+    let rows: Vec<(String, String)> = timed(
+        "degraded_tracks",
+        sqlx::query_as(
+            "SELECT DISTINCT track_id, content_type
+             FROM plays
+             WHERE metadata_source = 'cluster_map'
+             ORDER BY track_id
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(track_id, content_type)| DegradedTrack {
+            track_id,
+            kind: MediaKind::from_db(&content_type).unwrap_or(MediaKind::Track),
+        })
+        .collect())
+}
+
+/// Overwrite every degraded row of a track with a full record, re-labelling
+/// its kind (rows persisted before kinds existed may be episodes). Returns
+/// the number of rows repaired.
+#[instrument(skip(pool, meta), fields(track_id = %track_id, media.kind = kind.as_str()))]
+pub async fn repair_metadata(
+    pool: &PgPool,
+    track_id: &str,
+    kind: MediaKind,
+    meta: &TrackMeta,
+) -> sqlx::Result<u64> {
+    timed("repair_metadata", async {
+        let result = sqlx::query(
+            "UPDATE plays
+             SET title = $2, album = $3, artists = $4, cover_url = $5, duration_ms = $6,
+                 content_type = $7, metadata_source = 'fetch'
+             WHERE track_id = $1 AND metadata_source = 'cluster_map'",
+        )
+        .bind(track_id)
+        .bind(&meta.title)
+        .bind(&meta.album)
+        .bind(&meta.artists)
+        .bind(&meta.cover_url)
+        .bind(meta.duration_ms as i32)
+        .bind(kind.as_str())
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    })
+    .await
+}
+
+/// Retire a degraded track that Spotify no longer knows under any kind, so
+/// the repair pass stops retrying it. Its rows keep their degraded metadata.
+#[instrument(skip(pool))]
+pub async fn mark_unresolvable(pool: &PgPool, track_id: &str) -> sqlx::Result<u64> {
+    timed("mark_unresolvable", async {
+        let result = sqlx::query(
+            "UPDATE plays SET metadata_source = 'unresolvable'
+             WHERE track_id = $1 AND metadata_source = 'cluster_map'",
+        )
+        .bind(track_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    })
     .await
 }

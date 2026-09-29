@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use librespot::core::error::ErrorKind;
 use librespot::core::{Session, SpotifyUri};
-use librespot::metadata::{Metadata, Track};
-use librespot::protocol::metadata::Track as TrackMessage;
+use librespot::metadata::image::Images;
+use librespot::metadata::{Episode, Metadata, Track};
+use librespot::protocol::metadata::{Episode as EpisodeMessage, Track as TrackMessage};
 use lru::LruCache;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -15,7 +17,9 @@ use protobuf::Message as _;
 use tokio::sync::Mutex;
 use tracing::{instrument, warn};
 
-use crate::spotify::lyrics;
+use crate::events::{MediaKind, MetadataSource};
+use crate::spotify::cluster::classify;
+use crate::spotify::lyrics::{self, LyricsFetch};
 
 const IMAGE_URL_FALLBACK: &str = "https://i.scdn.co/image/{file_id}";
 
@@ -93,76 +97,156 @@ pub struct TrackMeta {
     pub duration_ms: u32,
     /// Present iff line-synced, scrambled lyrics exist (see spotify::lyrics).
     pub lyrics: Option<crate::events::Lyrics>,
+    pub source: MetadataSource,
 }
 
-/// The one part of metadata resolution that needs a live Spotify session:
-/// fetching the full track record. Split out so the resolver's cache and
-/// fallback logic (and `handle_update` above it) are testable with a fake.
+/// Upper bound for one metadata record fetch. `Track::request` normally
+/// answers in well under a second; librespot's HTTP client itself has no
+/// deadline, and a hung fetch would stall the whole cluster loop.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A failed record fetch, split by whether retrying can help: the repair
+/// pass gives up on `NotFound` records but only pauses on `Unavailable`.
+#[derive(Debug)]
+pub enum FetchError {
+    /// Spotify does not know the item as the requested kind (404, or a URI
+    /// the metadata endpoint rejects).
+    NotFound(anyhow::Error),
+    /// Network trouble, timeouts, 5xx, undecodable responses.
+    Unavailable(anyhow::Error),
+}
+
+impl FetchError {
+    fn from_librespot(context: &str, e: librespot::core::Error) -> Self {
+        let err = anyhow::anyhow!("{context}: {e}");
+        match e.kind {
+            ErrorKind::NotFound | ErrorKind::InvalidArgument => Self::NotFound(err),
+            _ => Self::Unavailable(err),
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(e) => write!(f, "not found: {e:#}"),
+            Self::Unavailable(e) => write!(f, "unavailable: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// The parts of metadata resolution that need a live Spotify session: the
+/// full item record and the lyrics. Split out so the resolver's cache,
+/// timeout and fallback logic (and `handle_update` above it) are testable
+/// with a fake.
 ///
 /// Desugared RPITIT instead of `async fn` so the `Send` bound is explicit —
 /// the whole spotify task runs under `tokio::spawn`. Impls may still use
 /// plain `async fn` (interchangeable since 1.75).
 pub trait FetchTrack: Send + Sync {
+    /// Fetch the record of a track or episode; lyrics are left `None`.
     fn fetch(
         &self,
-        track_uri: &str,
-    ) -> impl std::future::Future<Output = anyhow::Result<TrackMeta>> + Send;
+        uri: &str,
+        kind: MediaKind,
+    ) -> impl std::future::Future<Output = Result<TrackMeta, FetchError>> + Send;
+
+    fn fetch_lyrics(&self, track_id: &str)
+    -> impl std::future::Future<Output = LyricsFetch> + Send;
 }
 
-/// Production fetcher: `Track::get` plus the session's cover-URL template,
-/// with the lyrics fetch running concurrently (latency = max, not sum). A
-/// failed lyrics fetch never fails the track — it only degrades to `None`.
+/// Production fetcher: `Track::get`/`Episode::get` plus the session's
+/// cover-URL template.
 pub struct SessionFetcher {
     session: Session,
 }
 
-impl FetchTrack for SessionFetcher {
-    async fn fetch(&self, track_uri: &str) -> anyhow::Result<TrackMeta> {
-        let uri = SpotifyUri::from_uri(track_uri).context("parsing track uri")?;
-        let (track_id, _) = track_url(track_uri)?;
-
-        let track_fut = async {
-            api_metrics()
-                .requests
-                .add(1, &[KeyValue::new("endpoint", "metadata")]);
-            let bytes = Track::request(&self.session, &uri)
-                .await
-                .map_err(|e| anyhow::anyhow!("Track::request: {e}"))?;
-            api_metrics()
-                .response_bytes
-                .add(bytes.len() as u64, &[KeyValue::new("endpoint", "metadata")]);
-            let msg = TrackMessage::parse_from_bytes(&bytes).context("decoding track protobuf")?;
-            Track::parse(&msg, &uri).map_err(|e| anyhow::anyhow!("Track::parse: {e}"))
-        };
-        let (track, lyrics_fetch) =
-            tokio::join!(track_fut, lyrics::fetch(&self.session, &track_id));
-
-        metrics()
-            .lyrics_fetch
-            .add(1, &[KeyValue::new("outcome", lyrics_fetch.label())]);
-        tracing::Span::current().record("lyrics", lyrics_fetch.label());
-
-        let track = track?;
-        let template = self
-            .session
+impl SessionFetcher {
+    fn cover_template(&self) -> String {
+        self.session
             .get_user_attribute("image-url")
-            .unwrap_or_else(|| IMAGE_URL_FALLBACK.to_string());
-        let cover_url = widest_cover_url(&track, &template);
+            .unwrap_or_else(|| IMAGE_URL_FALLBACK.to_string())
+    }
 
-        Ok(TrackMeta {
-            title: track.name,
-            artists: track.artists.0.iter().map(|a| a.name.clone()).collect(),
-            album: track.album.name,
-            cover_url,
-            duration_ms: track.duration.max(0) as u32,
-            lyrics: lyrics_fetch.into_option(),
-        })
+    async fn request(
+        &self,
+        endpoint: &'static str,
+        request: impl std::future::Future<Output = Result<bytes::Bytes, librespot::core::Error>>,
+    ) -> Result<bytes::Bytes, FetchError> {
+        api_metrics()
+            .requests
+            .add(1, &[KeyValue::new("endpoint", endpoint)]);
+        let bytes = request
+            .await
+            .map_err(|e| FetchError::from_librespot(endpoint, e))?;
+        api_metrics()
+            .response_bytes
+            .add(bytes.len() as u64, &[KeyValue::new("endpoint", endpoint)]);
+        Ok(bytes)
     }
 }
 
-/// Resolves track metadata, preferring the full fetched record (complete
+impl FetchTrack for SessionFetcher {
+    async fn fetch(&self, uri_str: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
+        let uri = SpotifyUri::from_uri(uri_str)
+            .map_err(|e| FetchError::NotFound(anyhow::anyhow!("parsing uri: {e}")))?;
+        let undecodable = |e: &dyn std::fmt::Display| {
+            FetchError::Unavailable(anyhow::anyhow!("decoding {}: {e}", kind.as_str()))
+        };
+        match kind {
+            MediaKind::Track => {
+                let bytes = self
+                    .request("metadata", Track::request(&self.session, &uri))
+                    .await?;
+                let msg = TrackMessage::parse_from_bytes(&bytes).map_err(|e| undecodable(&e))?;
+                let track = Track::parse(&msg, &uri).map_err(|e| undecodable(&e))?;
+                Ok(TrackMeta {
+                    cover_url: widest_cover_url(&track.album.covers, &self.cover_template()),
+                    title: track.name,
+                    artists: track.artists.0.iter().map(|a| a.name.clone()).collect(),
+                    album: track.album.name,
+                    duration_ms: track.duration.max(0) as u32,
+                    lyrics: None,
+                    source: MetadataSource::Fetch,
+                })
+            }
+            MediaKind::Episode => {
+                let bytes = self
+                    .request("metadata", Episode::request(&self.session, &uri))
+                    .await?;
+                let msg = EpisodeMessage::parse_from_bytes(&bytes).map_err(|e| undecodable(&e))?;
+                let episode = Episode::parse(&msg, &uri).map_err(|e| undecodable(&e))?;
+                Ok(TrackMeta {
+                    cover_url: widest_cover_url(&episode.covers, &self.cover_template()),
+                    title: episode.name,
+                    artists: vec![episode.show_name.clone()],
+                    album: episode.show_name,
+                    duration_ms: episode.duration.max(0) as u32,
+                    lyrics: None,
+                    source: MetadataSource::Fetch,
+                })
+            }
+            MediaKind::Local => local_meta(uri_str).ok_or_else(|| {
+                FetchError::NotFound(anyhow::anyhow!("not a local file uri: {uri_str}"))
+            }),
+        }
+    }
+
+    async fn fetch_lyrics(&self, track_id: &str) -> LyricsFetch {
+        lyrics::fetch(&self.session, track_id).await
+    }
+}
+
+/// Resolves item metadata, preferring the full fetched record (complete
 /// artist list) and falling back to the cluster's metadata map if the fetch
-/// fails. Results are LRU-cached per track URI.
+/// fails or exceeds [`FETCH_TIMEOUT`]. Local files are described by their
+/// URI alone. Results are LRU-cached per URI.
 pub struct MetadataResolver<F: FetchTrack = SessionFetcher> {
     fetcher: F,
     cache: Mutex<LruCache<String, TrackMeta>>,
@@ -183,26 +267,38 @@ impl<F: FetchTrack> MetadataResolver<F> {
     }
 
     /// `source` records where the metadata came from: cache | fetch |
-    /// cluster_map. Only successful fetches are cached: the cluster-map
+    /// cluster_map | uri. Only successful fetches are cached: the cluster-map
     /// fallback lacks the artist list, and caching it would pin that degraded
     /// record for the LRU's lifetime — left uncached, the next play of the
-    /// track retries the full fetch.
+    /// item retries the full fetch (and the persisted row is marked for the
+    /// repair pass).
+    ///
+    /// The record fetch runs under [`FETCH_TIMEOUT`], concurrently with the
+    /// lyrics fetch for tracks (latency = max, not sum). A failed lyrics
+    /// fetch never fails the item — it only degrades to `None`.
     #[instrument(
         name = "metadata.resolve",
         skip(self, cluster_meta),
         fields(
             track_uri = %track_uri,
+            media.kind = kind.as_str(),
             source = tracing::field::Empty,
             lyrics = tracing::field::Empty,
+            fetch.timeout = tracing::field::Empty,
         )
     )]
     pub async fn resolve(
         &self,
         track_uri: &str,
+        kind: MediaKind,
         cluster_meta: &HashMap<String, String>,
         duration_hint_ms: i64,
     ) -> anyhow::Result<TrackMeta> {
         let span = tracing::Span::current();
+        if kind == MediaKind::Local {
+            span.record("source", "uri");
+            return local_meta(track_uri).context("local file uri without metadata");
+        }
         let m = metrics();
         if let Some(hit) = self.cache.lock().await.get(track_uri) {
             span.record("source", "cache");
@@ -212,16 +308,33 @@ impl<F: FetchTrack> MetadataResolver<F> {
         m.cache_misses.add(1, &[]);
 
         let started = Instant::now();
-        let fetched = self.fetcher.fetch(track_uri).await;
+        let lyrics_fut = async {
+            match (kind, media_link(track_uri)) {
+                (MediaKind::Track, Ok((track_id, _))) => {
+                    Some(self.fetcher.fetch_lyrics(&track_id).await)
+                }
+                _ => None,
+            }
+        };
+        let (fetched, lyrics_fetch) = tokio::join!(self.fetch_bounded(track_uri, kind), lyrics_fut);
         let outcome = if fetched.is_ok() { "ok" } else { "error" };
         m.fetch_duration.record(
             started.elapsed().as_secs_f64(),
             &[KeyValue::new("outcome", outcome)],
         );
+        let lyrics = lyrics_fetch.and_then(|l| {
+            m.lyrics_fetch
+                .add(1, &[KeyValue::new("outcome", l.label())]);
+            span.record("lyrics", l.label());
+            l.into_option()
+        });
 
         match fetched {
-            Ok(meta) => {
+            Ok(mut meta) => {
                 span.record("source", "fetch");
+                if lyrics.is_some() {
+                    meta.lyrics = lyrics;
+                }
                 self.cache
                     .lock()
                     .await
@@ -230,18 +343,39 @@ impl<F: FetchTrack> MetadataResolver<F> {
             }
             Err(e) => {
                 span.record("source", "cluster_map");
-                warn!("metadata fetch failed, falling back to cluster map: {e:#}");
+                warn!("metadata fetch failed, falling back to cluster map: {e}");
                 from_cluster_map(cluster_meta, duration_hint_ms)
                     .context("cluster metadata map insufficient")
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fetcher_for_tests(&self) -> &F {
+        &self.fetcher
+    }
+
+    /// Fetch a record bypassing cache and cluster-map fallback, for the
+    /// repair pass. Not cached: the result carries no lyrics, and caching it
+    /// would strip them from the next live play of the track.
+    pub async fn fetch_fresh(&self, uri: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
+        self.fetch_bounded(uri, kind).await
+    }
+
+    /// Records `fetch.timeout` on the current span.
+    async fn fetch_bounded(&self, uri: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
+        let result = tokio::time::timeout(FETCH_TIMEOUT, self.fetcher.fetch(uri, kind)).await;
+        tracing::Span::current().record("fetch.timeout", result.is_err());
+        result.unwrap_or_else(|_| {
+            Err(FetchError::Unavailable(anyhow::anyhow!(
+                "metadata fetch exceeded {FETCH_TIMEOUT:?}"
+            )))
+        })
+    }
 }
 
-fn widest_cover_url(track: &Track, template: &str) -> Option<String> {
-    track
-        .album
-        .covers
+fn widest_cover_url(covers: &Images, template: &str) -> Option<String> {
+    covers
         .0
         .iter()
         .max_by_key(|img| img.width)
@@ -276,6 +410,7 @@ fn from_cluster_map(meta: &HashMap<String, String>, duration_hint_ms: i64) -> Op
         cover_url,
         duration_ms,
         lyrics: None,
+        source: MetadataSource::ClusterMap,
     })
 }
 
@@ -287,35 +422,107 @@ fn normalize_image_url(value: &str) -> String {
     }
 }
 
-pub fn track_url(track_uri: &str) -> anyhow::Result<(String, String)> {
-    let uri = SpotifyUri::from_uri(track_uri).context("parsing track uri")?;
-    let id = uri
+/// Local file URIs carry their own metadata
+/// (`spotify:local:<artist>:<album>:<title>:<seconds>`), form-encoded: `+`
+/// is a space, `%XX` an escaped byte. No cover, no network.
+fn local_meta(uri: &str) -> Option<TrackMeta> {
+    let SpotifyUri::Local {
+        artist,
+        album_title,
+        track_title,
+        duration,
+    } = SpotifyUri::from_uri(uri).ok()?
+    else {
+        return None;
+    };
+    let artist = form_decode(&artist);
+    Some(TrackMeta {
+        title: form_decode(&track_title),
+        artists: (!artist.is_empty()).then_some(artist).into_iter().collect(),
+        album: form_decode(&album_title),
+        cover_url: None,
+        duration_ms: u32::try_from(duration.as_millis()).unwrap_or(u32::MAX),
+        lyrics: None,
+        source: MetadataSource::Uri,
+    })
+}
+
+/// `application/x-www-form-urlencoded` component decoding; malformed escapes
+/// pass through literally, invalid UTF-8 is replaced.
+fn form_decode(component: &str) -> String {
+    let bytes = component.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let hex = |i: usize| bytes.get(i).and_then(|&b| (b as char).to_digit(16));
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], hex(i + 1), hex(i + 2)) {
+            (b'+', ..) => out.push(b' '),
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 2;
+            }
+            (b, ..) => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Item id plus its public link for a cluster URI: `/track/` or `/episode/`,
+/// no link for local files (their id is the opaque URI remainder).
+pub fn media_link(uri: &str) -> anyhow::Result<(String, Option<String>)> {
+    let kind = classify(uri).map_err(|e| anyhow::anyhow!("unsupported media uri {uri}: {e:?}"))?;
+    let id = SpotifyUri::from_uri(uri)
+        .context("parsing media uri")?
         .to_id()
-        .map_err(|e| anyhow::anyhow!("track uri has no id: {e}"))?;
-    let url = format!("https://open.spotify.com/track/{id}");
+        .map_err(|e| anyhow::anyhow!("media uri has no id: {e}"))?;
+    let url = kind.open_url(&id);
     Ok((id, url))
 }
 
 /// Scripted fetcher for tests here and in `spotify::mod` (handle_update
-/// integration): pops one canned response per call, `None` → fetch error.
+/// integration): pops one canned response per record fetch; lyrics fetches
+/// always report `Missing`, so scripted lyrics ride the scripted record.
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{FetchTrack, TrackMeta};
+    use super::{FetchError, FetchTrack, TrackMeta};
+    use crate::events::MediaKind;
+    use crate::spotify::lyrics::LyricsFetch;
+
+    pub(crate) enum Scripted {
+        Meta(TrackMeta),
+        Unavailable,
+        NotFound,
+        /// Never completes; exercises the fetch timeout.
+        Hang,
+    }
 
     pub(crate) struct ScriptedFetcher {
-        responses: Mutex<VecDeque<Option<TrackMeta>>>,
+        responses: Mutex<VecDeque<Scripted>>,
         pub(crate) calls: AtomicUsize,
+        pub(crate) kinds: Mutex<Vec<MediaKind>>,
     }
 
     impl ScriptedFetcher {
+        /// `None` scripts an `Unavailable` failure.
         pub(crate) fn new(responses: Vec<Option<TrackMeta>>) -> Self {
+            Self::scripted(
+                responses
+                    .into_iter()
+                    .map(|r| r.map_or(Scripted::Unavailable, Scripted::Meta))
+                    .collect(),
+            )
+        }
+
+        pub(crate) fn scripted(responses: Vec<Scripted>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
                 calls: AtomicUsize::new(0),
+                kinds: Mutex::new(Vec::new()),
             }
         }
 
@@ -325,12 +532,22 @@ pub(crate) mod test_support {
     }
 
     impl FetchTrack for ScriptedFetcher {
-        async fn fetch(&self, _track_uri: &str) -> anyhow::Result<TrackMeta> {
+        async fn fetch(&self, _uri: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match self.responses.lock().unwrap().pop_front() {
-                Some(Some(meta)) => Ok(meta),
-                _ => Err(anyhow::anyhow!("scripted fetch failure")),
+            self.kinds.lock().unwrap().push(kind);
+            let next = self.responses.lock().unwrap().pop_front();
+            match next {
+                Some(Scripted::Meta(meta)) => Ok(meta),
+                Some(Scripted::NotFound) => Err(FetchError::NotFound(anyhow::anyhow!("scripted"))),
+                Some(Scripted::Hang) => std::future::pending().await,
+                Some(Scripted::Unavailable) | None => {
+                    Err(FetchError::Unavailable(anyhow::anyhow!("scripted")))
+                }
             }
+        }
+
+        async fn fetch_lyrics(&self, _track_id: &str) -> LyricsFetch {
+            LyricsFetch::Missing
         }
     }
 
@@ -342,6 +559,7 @@ pub(crate) mod test_support {
             cover_url: Some("https://i.scdn.co/image/abc".into()),
             duration_ms: 200_000,
             lyrics: None,
+            source: crate::events::MetadataSource::Fetch,
         }
     }
 
@@ -368,7 +586,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{ScriptedFetcher, full_meta, full_meta_with_lyrics};
+    use super::test_support::{Scripted, ScriptedFetcher, full_meta, full_meta_with_lyrics};
     use super::*;
 
     #[tokio::test]
@@ -377,13 +595,13 @@ mod tests {
             full_meta_with_lyrics("Song A"),
         )]));
         let meta = resolver
-            .resolve("spotify:track:a", &HashMap::new(), 0)
+            .resolve("spotify:track:a", MediaKind::Track, &HashMap::new(), 0)
             .await
             .unwrap();
         assert_eq!(meta.lyrics.as_ref().unwrap().lines.len(), 2);
 
         let cached = resolver
-            .resolve("spotify:track:a", &HashMap::new(), 0)
+            .resolve("spotify:track:a", MediaKind::Track, &HashMap::new(), 0)
             .await
             .unwrap();
         assert_eq!(cached.lyrics, meta.lyrics);
@@ -395,11 +613,17 @@ mod tests {
             MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Hit"))]));
         let map = HashMap::new();
 
-        let first = resolver.resolve("spotify:track:x", &map, 0).await.unwrap();
+        let first = resolver
+            .resolve("spotify:track:x", MediaKind::Track, &map, 0)
+            .await
+            .unwrap();
         assert_eq!(first.title, "Hit");
         assert_eq!(resolver.fetcher.call_count(), 1);
 
-        let second = resolver.resolve("spotify:track:x", &map, 0).await.unwrap();
+        let second = resolver
+            .resolve("spotify:track:x", MediaKind::Track, &map, 0)
+            .await
+            .unwrap();
         assert_eq!(second.title, "Hit");
         assert_eq!(resolver.fetcher.call_count(), 1);
     }
@@ -414,14 +638,14 @@ mod tests {
         map.insert("title".to_string(), "Fallback Title".to_string());
 
         let degraded = resolver
-            .resolve("spotify:track:x", &map, 1_000)
+            .resolve("spotify:track:x", MediaKind::Track, &map, 1_000)
             .await
             .unwrap();
         assert_eq!(degraded.title, "Fallback Title");
         assert!(degraded.artists.is_empty());
 
         let healed = resolver
-            .resolve("spotify:track:x", &map, 1_000)
+            .resolve("spotify:track:x", MediaKind::Track, &map, 1_000)
             .await
             .unwrap();
         assert_eq!(healed.title, "Recovered");
@@ -429,7 +653,7 @@ mod tests {
         assert_eq!(resolver.fetcher.call_count(), 2);
 
         resolver
-            .resolve("spotify:track:x", &map, 1_000)
+            .resolve("spotify:track:x", MediaKind::Track, &map, 1_000)
             .await
             .unwrap();
         assert_eq!(resolver.fetcher.call_count(), 2);
@@ -439,7 +663,7 @@ mod tests {
     async fn failed_fetch_without_usable_fallback_is_an_error() {
         let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![None]));
         let result = resolver
-            .resolve("spotify:track:x", &HashMap::new(), 0)
+            .resolve("spotify:track:x", MediaKind::Track, &HashMap::new(), 0)
             .await;
         assert!(result.is_err());
     }
@@ -467,6 +691,7 @@ mod tests {
             "spotify:image:xlarge".to_string(),
         );
         let meta = from_cluster_map(&m, 196_133).unwrap();
+        assert_eq!(meta.source, MetadataSource::ClusterMap);
         assert_eq!(meta.title, "Breaking the Habit");
         assert!(meta.artists.is_empty());
         assert_eq!(meta.duration_ms, 196_133);
@@ -483,9 +708,125 @@ mod tests {
     }
 
     #[test]
-    fn builds_track_urls() {
-        let (id, url) = track_url("spotify:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
+    fn media_links_per_kind() {
+        let (id, url) = media_link("spotify:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
         assert_eq!(id, "4uLU6hMCjMI75M1A2tKUQC");
-        assert_eq!(url, "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
+        );
+
+        let (id, url) = media_link("spotify:episode:512ojhOuo1ktJprKbVcKyQ").unwrap();
+        assert_eq!(id, "512ojhOuo1ktJprKbVcKyQ");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/episode/512ojhOuo1ktJprKbVcKyQ")
+        );
+
+        let (id, url) = media_link("spotify:local:Artist:Album:Title:127").unwrap();
+        assert_eq!(id, "Artist:Album:Title:127");
+        assert_eq!(url, None);
+
+        assert!(media_link("spotify:ad:5sWHDYs0csV6RS48xBl0tH").is_err());
+    }
+
+    #[test]
+    fn local_file_metadata_comes_from_the_form_encoded_uri() {
+        let meta = local_meta(
+            "spotify:local:David+Wise:Donkey+Kong+Country%3A+Tropical+Freeze:Snomads+Island:127",
+        )
+        .unwrap();
+        assert_eq!(meta.title, "Snomads Island");
+        assert_eq!(meta.artists, ["David Wise"]);
+        assert_eq!(meta.album, "Donkey Kong Country: Tropical Freeze");
+        assert_eq!(meta.duration_ms, 127_000);
+        assert_eq!(meta.source, MetadataSource::Uri);
+
+        let anonymous = local_meta("spotify:local:::Untitled:5").unwrap();
+        assert!(anonymous.artists.is_empty());
+    }
+
+    #[test]
+    fn form_decode_is_lenient() {
+        assert_eq!(form_decode("a+b%20c"), "a b c");
+        assert_eq!(form_decode("100%"), "100%");
+        assert_eq!(form_decode("%zz"), "%zz");
+        assert_eq!(form_decode("%C3%BCber"), "über");
+    }
+
+    /// Local files never touch the network.
+    #[tokio::test]
+    async fn local_resolution_skips_the_fetcher() {
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![]));
+        let meta = resolver
+            .resolve(
+                "spotify:local:Artist:Album:Title:60",
+                MediaKind::Local,
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta.title, "Title");
+        assert_eq!(resolver.fetcher.call_count(), 0);
+    }
+
+    /// A hung record fetch must not stall the caller beyond FETCH_TIMEOUT;
+    /// the cluster-map fallback takes over and is marked degraded.
+    #[tokio::test(start_paused = true)]
+    async fn hung_fetch_times_out_into_the_cluster_map_fallback() {
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::scripted(vec![Scripted::Hang]));
+        let mut map = HashMap::new();
+        map.insert("title".to_string(), "Fallback".to_string());
+
+        let started = tokio::time::Instant::now();
+        let meta = resolver
+            .resolve("spotify:track:x", MediaKind::Track, &map, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(meta.title, "Fallback");
+        assert_eq!(meta.source, MetadataSource::ClusterMap);
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+    }
+
+    /// The repair pass needs the raw error class: no cluster-map fallback,
+    /// no caching.
+    #[tokio::test]
+    async fn fetch_fresh_reports_not_found_without_fallback() {
+        let resolver = MetadataResolver::with_fetcher(ScriptedFetcher::scripted(vec![
+            Scripted::NotFound,
+            Scripted::Meta(full_meta("Fresh")),
+        ]));
+        let err = resolver
+            .fetch_fresh("spotify:track:x", MediaKind::Track)
+            .await
+            .unwrap_err();
+        assert!(err.is_not_found());
+        let fresh = resolver
+            .fetch_fresh("spotify:track:x", MediaKind::Track)
+            .await
+            .unwrap();
+        assert_eq!(fresh.title, "Fresh");
+        assert!(resolver.cache.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn episodes_are_fetched_as_episodes() {
+        let resolver =
+            MetadataResolver::with_fetcher(ScriptedFetcher::new(vec![Some(full_meta("Pod"))]));
+        resolver
+            .resolve(
+                "spotify:episode:512ojhOuo1ktJprKbVcKyQ",
+                MediaKind::Episode,
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *resolver.fetcher.kinds.lock().unwrap(),
+            [MediaKind::Episode]
+        );
     }
 }
