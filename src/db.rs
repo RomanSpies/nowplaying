@@ -342,6 +342,24 @@ pub async fn repair_metadata(
     .await
 }
 
+/// Rows per non-`fetch` metadata source, for the `plays_degraded` gauge.
+/// Both sources are always present (0 when empty), so the gauge series never
+/// silently disappear once the backlog is cleared.
+#[instrument(skip(pool))]
+pub async fn degraded_counts(pool: &PgPool) -> sqlx::Result<[(&'static str, i64); 2]> {
+    let (cluster_map, unresolvable): (i64, i64) = timed(
+        "degraded_counts",
+        sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE metadata_source = 'cluster_map'),
+                    count(*) FILTER (WHERE metadata_source = 'unresolvable')
+             FROM plays",
+        )
+        .fetch_one(pool),
+    )
+    .await?;
+    Ok([("cluster_map", cluster_map), ("unresolvable", unresolvable)])
+}
+
 /// Retire a degraded track that Spotify no longer knows under any kind, so
 /// the repair pass stops retrying it. Its rows keep their degraded metadata.
 #[instrument(skip(pool))]

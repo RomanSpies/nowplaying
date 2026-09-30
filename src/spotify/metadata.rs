@@ -25,15 +25,21 @@ const IMAGE_URL_FALLBACK: &str = "https://i.scdn.co/image/{file_id}";
 
 struct MetaMetrics {
     fetch_duration: Histogram<f64>,
+    lyrics_duration: Histogram<f64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
     lyrics_fetch: Counter<u64>,
 }
 
 /// Fetch-duration boundaries mirror the semconv `http.server.request.duration`
-/// buckets — `Track::get` is a network round trip too, and the SDK defaults
+/// buckets — both fetches are network round trips, and the SDK defaults
 /// assume multi-second scales that would dump all sub-second fetches into the
-/// lowest buckets.
+/// lowest buckets. Record and lyrics fetches run concurrently but are timed
+/// separately, so a slow lyrics endpoint never reads as slow metadata.
+const FETCH_BOUNDARIES: [f64; 14] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
 fn metrics() -> &'static MetaMetrics {
     static METRICS: OnceLock<MetaMetrics> = OnceLock::new();
     METRICS.get_or_init(|| {
@@ -42,10 +48,16 @@ fn metrics() -> &'static MetaMetrics {
             fetch_duration: meter
                 .f64_histogram("metadata_fetch_duration")
                 .with_unit("s")
-                .with_description("Track::get latency, labelled by outcome")
-                .with_boundaries(vec![
-                    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
-                ])
+                .with_description(
+                    "Track/episode record fetch latency by outcome (ok|error|timeout)",
+                )
+                .with_boundaries(FETCH_BOUNDARIES.to_vec())
+                .build(),
+            lyrics_duration: meter
+                .f64_histogram("lyrics_fetch_duration")
+                .with_unit("s")
+                .with_description("Lyrics fetch latency by outcome (ok|unsynced|none|error)")
+                .with_boundaries(FETCH_BOUNDARIES.to_vec())
                 .build(),
             cache_hits: meter
                 .u64_counter("metadata_cache_hits_total")
@@ -112,8 +124,10 @@ pub enum FetchError {
     /// Spotify does not know the item as the requested kind (404, or a URI
     /// the metadata endpoint rejects).
     NotFound(anyhow::Error),
-    /// Network trouble, timeouts, 5xx, undecodable responses.
+    /// Network trouble, 5xx, undecodable responses.
     Unavailable(anyhow::Error),
+    /// No answer within [`FETCH_TIMEOUT`]; retryable like `Unavailable`.
+    TimedOut,
 }
 
 impl FetchError {
@@ -128,6 +142,14 @@ impl FetchError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
     }
+
+    /// Metric/span label for a failed fetch.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TimedOut => "timeout",
+            Self::NotFound(_) | Self::Unavailable(_) => "error",
+        }
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -135,6 +157,7 @@ impl std::fmt::Display for FetchError {
         match self {
             Self::NotFound(e) => write!(f, "not found: {e:#}"),
             Self::Unavailable(e) => write!(f, "unavailable: {e:#}"),
+            Self::TimedOut => write!(f, "no answer within {FETCH_TIMEOUT:?}"),
         }
     }
 }
@@ -307,21 +330,29 @@ impl<F: FetchTrack> MetadataResolver<F> {
         }
         m.cache_misses.add(1, &[]);
 
-        let started = Instant::now();
-        let lyrics_fut = async {
-            match (kind, media_link(track_uri)) {
-                (MediaKind::Track, Ok((track_id, _))) => {
-                    Some(self.fetcher.fetch_lyrics(&track_id).await)
-                }
-                _ => None,
-            }
+        let record_fut = async {
+            let started = Instant::now();
+            let fetched = self.fetch_bounded(track_uri, kind).await;
+            let outcome = fetched.as_ref().map_or_else(FetchError::label, |_| "ok");
+            m.fetch_duration.record(
+                started.elapsed().as_secs_f64(),
+                &[KeyValue::new("outcome", outcome)],
+            );
+            fetched
         };
-        let (fetched, lyrics_fetch) = tokio::join!(self.fetch_bounded(track_uri, kind), lyrics_fut);
-        let outcome = if fetched.is_ok() { "ok" } else { "error" };
-        m.fetch_duration.record(
-            started.elapsed().as_secs_f64(),
-            &[KeyValue::new("outcome", outcome)],
-        );
+        let lyrics_fut = async {
+            let (MediaKind::Track, Ok((track_id, _))) = (kind, media_link(track_uri)) else {
+                return None;
+            };
+            let started = Instant::now();
+            let lyrics = self.fetcher.fetch_lyrics(&track_id).await;
+            m.lyrics_duration.record(
+                started.elapsed().as_secs_f64(),
+                &[KeyValue::new("outcome", lyrics.label())],
+            );
+            Some(lyrics)
+        };
+        let (fetched, lyrics_fetch) = tokio::join!(record_fut, lyrics_fut);
         let lyrics = lyrics_fetch.and_then(|l| {
             m.lyrics_fetch
                 .add(1, &[KeyValue::new("outcome", l.label())]);
@@ -343,7 +374,7 @@ impl<F: FetchTrack> MetadataResolver<F> {
             }
             Err(e) => {
                 span.record("source", "cluster_map");
-                warn!("metadata fetch failed, falling back to cluster map: {e}");
+                warn!(error = %e, "metadata fetch failed, falling back to cluster map");
                 from_cluster_map(cluster_meta, duration_hint_ms)
                     .context("cluster metadata map insufficient")
             }
@@ -366,11 +397,7 @@ impl<F: FetchTrack> MetadataResolver<F> {
     async fn fetch_bounded(&self, uri: &str, kind: MediaKind) -> Result<TrackMeta, FetchError> {
         let result = tokio::time::timeout(FETCH_TIMEOUT, self.fetcher.fetch(uri, kind)).await;
         tracing::Span::current().record("fetch.timeout", result.is_err());
-        result.unwrap_or_else(|_| {
-            Err(FetchError::Unavailable(anyhow::anyhow!(
-                "metadata fetch exceeded {FETCH_TIMEOUT:?}"
-            )))
-        })
+        result.unwrap_or(Err(FetchError::TimedOut))
     }
 }
 
@@ -809,6 +836,17 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.title, "Fresh");
         assert!(resolver.cache.lock().await.is_empty());
+    }
+
+    #[test]
+    fn fetch_error_labels_separate_timeouts() {
+        assert_eq!(FetchError::TimedOut.label(), "timeout");
+        assert!(!FetchError::TimedOut.is_not_found());
+        assert_eq!(FetchError::NotFound(anyhow::anyhow!("x")).label(), "error");
+        assert_eq!(
+            FetchError::Unavailable(anyhow::anyhow!("x")).label(),
+            "error"
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@ use std::time::Duration;
 use clap::Parser;
 use futures_util::StreamExt;
 use nowplaying::config::Config;
-use nowplaying::events::PlayEvent;
+use nowplaying::events::{MediaKind, MetadataSource, PlayEvent};
+use nowplaying::spotify::lyrics::LyricsFetch;
+use nowplaying::spotify::metadata::{FetchError, FetchTrack, MetadataResolver, TrackMeta};
 use nowplaying::spotify::pending::{DiscardReason, PendingPersist, PersistFn};
 use nowplaying::state::AppState;
 use nowplaying::web;
@@ -64,6 +66,27 @@ fn sample_play() -> PlayEvent {
         started_at: "2026-07-29T12:00:00Z".parse().unwrap(),
         lyrics: None,
         metadata_source: nowplaying::events::MetadataSource::Fetch,
+    }
+}
+
+/// Answers every record fetch at once; lyrics are always absent.
+struct InstantFetcher;
+
+impl FetchTrack for InstantFetcher {
+    async fn fetch(&self, _uri: &str, _kind: MediaKind) -> Result<TrackMeta, FetchError> {
+        Ok(TrackMeta {
+            title: "T".into(),
+            artists: vec!["A".into()],
+            album: "Al".into(),
+            cover_url: None,
+            duration_ms: 1_000,
+            lyrics: None,
+            source: MetadataSource::Fetch,
+        })
+    }
+
+    async fn fetch_lyrics(&self, _track_id: &str) -> LyricsFetch {
+        LyricsFetch::Missing
     }
 }
 
@@ -141,6 +164,17 @@ async fn instruments_record_on_their_code_paths() {
     );
     pending.discard(DiscardReason::Superseded);
 
+    let resolver = MetadataResolver::with_fetcher(InstantFetcher);
+    resolver
+        .resolve(
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+            MediaKind::Track,
+            &std::collections::HashMap::new(),
+            0,
+        )
+        .await
+        .expect("fetched metadata");
+
     provider.force_flush().expect("flush metrics");
     let finished = exporter.get_finished_metrics().expect("exported metrics");
     let dump = format!("{finished:?}");
@@ -156,6 +190,8 @@ async fn instruments_record_on_their_code_paths() {
         "db.client.operation.duration",
         "plays_discarded_total",
         "superseded",
+        "metadata_fetch_duration",
+        "lyrics_fetch_duration",
     ] {
         assert!(
             dump.contains(needle),

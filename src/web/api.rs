@@ -93,7 +93,7 @@ pub async fn top(State(state): State<AppState>, Query(params): Query<TopParams>)
             ([(header::CACHE_CONTROL, cache_control)], Json(body)).into_response()
         }
         Err(e) => {
-            error!("top query failed: {e}");
+            error!(error = %e, "top query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

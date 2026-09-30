@@ -63,14 +63,14 @@ pub async fn fetch(session: &Session, track_id: &str) -> LyricsFetch {
             match SpotifyLyrics::try_from(&bytes) {
                 Ok(lyrics) => convert(lyrics, track_id),
                 Err(e) => {
-                    warn!(track_id, "lyrics response undecodable: {e}");
+                    warn!(track_id, error = %e, "lyrics response undecodable");
                     LyricsFetch::Error
                 }
             }
         }
         Err(e) if e.kind == ErrorKind::NotFound => LyricsFetch::Missing,
         Err(e) => {
-            warn!(track_id, "lyrics fetch failed: {e}");
+            warn!(track_id, error = %e, "lyrics fetch failed");
             LyricsFetch::Error
         }
     }

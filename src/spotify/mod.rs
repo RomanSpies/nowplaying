@@ -6,8 +6,8 @@ pub mod reconnect;
 pub mod session;
 pub mod sink;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow};
@@ -20,7 +20,7 @@ use librespot::core::error::ErrorKind;
 use librespot::protocol::connect::ClusterUpdate;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, ObservableGauge};
+use opentelemetry::metrics::{Counter, Gauge, Meter, ObservableGauge};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -37,7 +37,8 @@ use crate::spotify::metadata::{FetchTrack, MetadataResolver, TrackMeta, media_li
 use crate::spotify::pending::{DiscardReason, PendingPersist, PersistFn};
 use crate::spotify::reconnect::ReconnectBudget;
 use crate::spotify::session::MissingCredentials;
-use crate::state::AppState;
+use crate::state::{AppState, cluster_update_age};
+use crate::web::top_cache::TopCache;
 
 const CLUSTER_URI: &str = "hm://connect-state/v1/cluster";
 const MAX_RECONNECTS: usize = 5;
@@ -54,8 +55,9 @@ const PERSIST_BACKOFF: Duration = Duration::from_secs(1);
 const CREDENTIALS_POLL: Duration = Duration::from_secs(60);
 const REPAIR_INTERVAL: Duration = Duration::from_secs(3600);
 const REPAIR_BATCH: i64 = 50;
-/// Consecutive `Unavailable` fetches after which a repair run gives up
-/// (circuit breaker: Spotify is having trouble, retry next interval).
+/// Consecutive unavailable or timed-out fetches after which a repair run
+/// gives up (circuit breaker: Spotify is having trouble, retry next
+/// interval).
 const REPAIR_MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 struct Metrics {
@@ -68,14 +70,27 @@ struct Metrics {
     reconnects: Counter<u64>,
     session_invalid: Counter<u64>,
     db_errors: Counter<u64>,
-    /// Kept alive so the observable callback stays registered.
+    persist_failed: Counter<u64>,
+    /// Kept alive so the observable callbacks stay registered.
     _connected: ObservableGauge<u64>,
+    _auth_failed: ObservableGauge<u64>,
+    _cluster_update_age: ObservableGauge<f64>,
 }
 
 impl Metrics {
-    fn new(state: &AppState) -> Self {
-        let meter = global::meter("nowplaying");
+    /// `meter` is injected so tests can observe the instruments through a
+    /// private provider instead of the process-global one.
+    ///
+    /// `spotify_connected` alone cannot tell a self-healing reconnect from a
+    /// parked credential failure; `spotify_auth_failed` is the alertable
+    /// "needs `--login`" signal. `spotify_cluster_update_age` exposes a
+    /// dealer that stays connected but stops delivering — long silence is
+    /// also normal while nothing plays, so read it together with the
+    /// playback state rather than alerting on it alone.
+    fn new(meter: &Meter, state: &AppState) -> Self {
         let connected = state.spotify_connected.clone();
+        let auth_failed = state.spotify_auth_failed.clone();
+        let last_update = state.last_cluster_update_ms.clone();
         Self {
             plays: meter
                 .u64_counter("plays_total")
@@ -112,6 +127,30 @@ impl Metrics {
             db_errors: meter
                 .u64_counter("db_errors_total")
                 .with_description("Failed Postgres operations")
+                .build(),
+            persist_failed: meter
+                .u64_counter("plays_persist_failed_total")
+                .with_description("Qualified plays lost after every insert attempt failed")
+                .build(),
+            _auth_failed: meter
+                .u64_observable_gauge("spotify_auth_failed")
+                .with_description("1 while parked on missing or rejected Spotify credentials")
+                .with_callback(move |o| {
+                    o.observe(auth_failed.load(Ordering::Relaxed) as u64, &[]);
+                })
+                .build(),
+            _cluster_update_age: meter
+                .f64_observable_gauge("spotify_cluster_update_age")
+                .with_unit("s")
+                .with_description("Time since the last message on the dealer cluster stream")
+                .with_callback(move |o| {
+                    if let Some(age) = cluster_update_age(
+                        last_update.load(Ordering::Relaxed),
+                        Utc::now().timestamp_millis(),
+                    ) {
+                        o.observe(age.as_secs_f64(), &[]);
+                    }
+                })
                 .build(),
             _connected: meter
                 .u64_observable_gauge("spotify_connected")
@@ -152,7 +191,7 @@ impl DeviceControl for SpircDevice<'_> {
 
     fn release(&self) {
         if let Err(e) = self.spirc.disconnect(true) {
-            warn!("releasing own device failed: {e}");
+            warn!(error = %e, "releasing own device failed");
         }
     }
 }
@@ -185,7 +224,7 @@ impl Drop for AbortOnDrop {
 /// Owns the per-process playback [`Pipeline`] across reconnects and discards
 /// a still-unqualified play exactly once, when the task ends.
 async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
-    let metrics = Metrics::new(&state);
+    let metrics = Metrics::new(&global::meter("nowplaying"), &state);
     let mut pipeline = Pipeline::default();
     let result = supervise(&state, &metrics, &mut pipeline, &mut shutdown).await;
     if let Some(p) = pipeline.pending.take() {
@@ -243,7 +282,7 @@ async fn supervise(
                 info!(
                     reconnect.backoff_ms = backoff.as_millis() as u64,
                     reconnect.budget_remaining = budget.remaining(),
-                    "reconnecting to Spotify in {backoff:?}"
+                    "reconnecting to Spotify"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
@@ -411,9 +450,12 @@ async fn run_once(
                 }
             }
             item = cluster_stream.next() => {
+                if item.is_some() {
+                    state.mark_cluster_update();
+                }
                 match item {
                     None => break Err(ConnectError::Transient(anyhow!("cluster update stream ended"))),
-                    Some(Err(e)) => warn!("undecodable cluster update: {e}"),
+                    Some(Err(e)) => warn!(error = %e, "undecodable cluster update"),
                     Some(Ok(update)) => {
                         handle_update(state, metrics, &resolver, pipeline, &persist, &device, update)
                             .await;
@@ -626,7 +668,7 @@ async fn handle_update<F: FetchTrack>(
                 Err(e) => {
                     span.record("outcome", "metadata_failed");
                     span.record("otel.status_code", "ERROR");
-                    error!("dropping play, metadata unresolvable: {e:#}")
+                    error!(error = %format!("{e:#}"), "dropping play, metadata unresolvable")
                 }
             }
         }
@@ -678,7 +720,7 @@ async fn publish_live<F: FetchTrack>(
     let track_id = match media_link(&patch.track_uri) {
         Ok((id, _)) => id,
         Err(e) => {
-            warn!("dropping state update, unparsable track uri: {e:#}");
+            warn!(error = %format!("{e:#}"), "dropping state update, unparsable track uri");
             return;
         }
     };
@@ -714,7 +756,11 @@ async fn publish_live<F: FetchTrack>(
                 "now_playing"
             }
             Err(e) => {
-                debug!(track_id = %track_id, "dropping state frame, metadata unresolvable: {e:#}");
+                debug!(
+                    track_id = %track_id,
+                    error = %format!("{e:#}"),
+                    "dropping state frame, metadata unresolvable"
+                );
                 return;
             }
         }
@@ -817,6 +863,62 @@ where
     }
 }
 
+/// Everything that happens after the insert attempts of one play: metrics,
+/// cache invalidation, span fields and — for a lost play — an error log
+/// carrying the full play so it can be restored by hand.
+#[derive(Clone)]
+struct PersistSink {
+    persisted: Counter<u64>,
+    replay_suppressed: Counter<u64>,
+    persist_failed: Counter<u64>,
+    top_cache: Arc<TopCache>,
+}
+
+impl PersistSink {
+    fn new(state: &AppState, metrics: &Metrics) -> Self {
+        Self {
+            persisted: metrics.persisted.clone(),
+            replay_suppressed: metrics.replay_suppressed.clone(),
+            persist_failed: metrics.persist_failed.clone(),
+            top_cache: state.top_cache.clone(),
+        }
+    }
+
+    fn settle(&self, event: &PlayEvent, outcome: PersistOutcome<sqlx::Error>, attempts: u32) {
+        let span = tracing::Span::current();
+        span.record("persist.attempts", attempts);
+        span.record("outcome", outcome.as_str());
+        match outcome {
+            PersistOutcome::Persisted => {
+                self.persisted.add(1, &[]);
+                self.top_cache.invalidate();
+            }
+            PersistOutcome::ReplaySuppressed => {
+                self.replay_suppressed.add(1, &[]);
+                info!(track_id = %event.track_id, "duplicate or replayed play suppressed");
+            }
+            PersistOutcome::Failed(e) => {
+                self.persist_failed.add(1, &[]);
+                span.record("otel.status_code", "ERROR");
+                error!(
+                    track_id = %event.track_id,
+                    kind = event.kind.as_str(),
+                    title = %event.title,
+                    artists = ?event.artists,
+                    album = %event.album,
+                    cover_url = ?event.cover_url,
+                    duration_ms = event.duration_ms,
+                    started_at = %event.started_at,
+                    metadata_source = event.metadata_source.as_str(),
+                    attempts,
+                    error = %e,
+                    "persisting play failed permanently; play lost"
+                );
+            }
+        }
+    }
+}
+
 /// Build the action `PendingPersist` runs once a play has accumulated enough
 /// listening: a guarded, idempotent insert (see `db::insert_play_guarded`)
 /// with bounded retries, so a short Postgres outage does not lose plays.
@@ -824,22 +926,17 @@ where
 /// `ReplaySuppressed` means the DB replay guard swallowed a reconnect
 /// duplicate — counted in `plays_replay_suppressed_total`; a rising rate
 /// there means reconnects re-detect running playbacks more often than
-/// expected. A successful insert invalidates the top-list cache. The future
+/// expected. `db_errors_total` counts every failed attempt, while
+/// `plays_persist_failed_total` counts only plays actually lost. The future
 /// runs instrumented with the `play.persist` span: every failed attempt is a
-/// span event, `persist.attempts`/`outcome` are recorded at the end, and a
-/// permanent failure sets `otel.status_code = ERROR` and logs the full play
-/// so it can be restored by hand.
+/// span event, the final outcome is settled by [`PersistSink`].
 fn make_persist_fn(state: &AppState, metrics: &Metrics) -> PersistFn {
     let pool = state.db.clone();
-    let top_cache = state.top_cache.clone();
-    let persisted = metrics.persisted.clone();
-    let replay_suppressed = metrics.replay_suppressed.clone();
+    let sink = PersistSink::new(state, metrics);
     let db_errors = metrics.db_errors.clone();
     Arc::new(move |event: PlayEvent| {
         let pool = pool.clone();
-        let top_cache = top_cache.clone();
-        let persisted = persisted.clone();
-        let replay_suppressed = replay_suppressed.clone();
+        let sink = sink.clone();
         let db_errors = db_errors.clone();
         Box::pin(async move {
             let (outcome, attempts) = persist_with_retry(
@@ -859,36 +956,7 @@ fn make_persist_fn(state: &AppState, metrics: &Metrics) -> PersistFn {
                 },
             )
             .await;
-            let span = tracing::Span::current();
-            span.record("persist.attempts", attempts);
-            span.record("outcome", outcome.as_str());
-            match outcome {
-                PersistOutcome::Persisted => {
-                    persisted.add(1, &[]);
-                    top_cache.invalidate();
-                }
-                PersistOutcome::ReplaySuppressed => {
-                    replay_suppressed.add(1, &[]);
-                    info!(track_id = %event.track_id, "duplicate or replayed play suppressed");
-                }
-                PersistOutcome::Failed(e) => {
-                    span.record("otel.status_code", "ERROR");
-                    error!(
-                        track_id = %event.track_id,
-                        kind = event.kind.as_str(),
-                        title = %event.title,
-                        artists = ?event.artists,
-                        album = %event.album,
-                        cover_url = ?event.cover_url,
-                        duration_ms = event.duration_ms,
-                        started_at = %event.started_at,
-                        metadata_source = event.metadata_source.as_str(),
-                        attempts,
-                        error = %e,
-                        "persisting play failed permanently; play lost"
-                    );
-                }
-            }
+            sink.settle(&event, outcome, attempts);
         })
     })
 }
@@ -901,6 +969,19 @@ async fn repair_loop<F: FetchTrack>(pool: PgPool, resolver: Arc<MetadataResolver
         interval.tick().await;
         repair_degraded(&pool, &resolver).await;
     }
+}
+
+/// Degraded-row backlog, refreshed after every repair pass. Shows whether
+/// the backlog actually shrinks; `unresolvable` rows are retired for good
+/// and only ever grow.
+fn degraded_gauge() -> &'static Gauge<u64> {
+    static GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        global::meter("nowplaying")
+            .u64_gauge("plays_degraded")
+            .with_description("Persisted plays without full metadata, by metadata_source")
+            .build()
+    })
 }
 
 /// Per-run tally of [`repair_degraded`].
@@ -957,7 +1038,7 @@ pub async fn repair_degraded<F: FetchTrack>(
         Ok(tracks) => tracks,
         Err(e) => {
             span.record("otel.status_code", "ERROR");
-            warn!("listing degraded tracks failed: {e}");
+            warn!(error = %e, "listing degraded tracks failed");
             return summary;
         }
     };
@@ -990,6 +1071,17 @@ pub async fn repair_degraded<F: FetchTrack>(
     span.record("tracks.checked", summary.checked);
     span.record("tracks.repaired", summary.repaired);
     span.record("tracks.failed", summary.failed);
+    match db::degraded_counts(pool).await {
+        Ok(counts) => {
+            for (source, rows) in counts {
+                degraded_gauge().record(
+                    rows.max(0) as u64,
+                    &[KeyValue::new("metadata_source", source)],
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "counting degraded rows failed"),
+    }
     if summary.checked > 0 {
         info!(
             checked = summary.checked,
@@ -1032,19 +1124,19 @@ async fn repair_track<F: FetchTrack>(
         Ok((kind, meta)) => match db::repair_metadata(pool, &track.track_id, kind, &meta).await {
             Ok(_) => RepairOutcome::Repaired,
             Err(e) => {
-                warn!("writing repaired metadata failed: {e}");
+                warn!(error = %e, "writing repaired metadata failed");
                 RepairOutcome::DbError
             }
         },
         Err(e) if e.is_not_found() => match db::mark_unresolvable(pool, &track.track_id).await {
             Ok(_) => RepairOutcome::Unresolvable,
             Err(e) => {
-                warn!("retiring unresolvable track failed: {e}");
+                warn!(error = %e, "retiring unresolvable track failed");
                 RepairOutcome::DbError
             }
         },
         Err(e) => {
-            debug!("repair fetch failed: {e}");
+            debug!(error = %e, "repair fetch failed");
             RepairOutcome::Unavailable
         }
     };
@@ -1168,7 +1260,7 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let state = test_state();
-            let metrics = Metrics::new(&state);
+            let metrics = Metrics::new(&global::meter("nowplaying"), &state);
             let seen = Arc::new(StdMutex::new(Vec::new()));
             let sink = seen.clone();
             let persist: PersistFn = Arc::new(move |event: PlayEvent| {
@@ -1745,5 +1837,53 @@ mod tests {
         let frame = rx.try_recv().expect("restart must broadcast a play");
         assert_eq!(frame.kind, FrameKind::Play);
         assert_eq!(json(&frame)["type"], "play");
+    }
+
+    /// The alerting instruments record through a private provider: a lost
+    /// play counts once in `plays_persist_failed_total` (not per attempt),
+    /// and both gauges report live state — the cluster age only once an
+    /// update was seen.
+    #[tokio::test]
+    async fn alerting_metrics_record_lost_plays_auth_state_and_cluster_age() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let state = test_state();
+        let metrics = Metrics::new(&provider.meter("nowplaying"), &state);
+        let dump = || {
+            provider.force_flush().unwrap();
+            format!("{:?}", exporter.get_finished_metrics().unwrap())
+        };
+
+        assert!(!dump().contains("spotify_cluster_update_age"));
+
+        state.set_spotify_auth_failed(true);
+        state.mark_cluster_update();
+        let event = play_event(
+            TRACK_A,
+            MediaKind::Track,
+            full_meta("Song A"),
+            Utc::now().timestamp_millis(),
+            0,
+        )
+        .unwrap();
+        PersistSink::new(&state, &metrics).settle(
+            &event,
+            PersistOutcome::Failed(sqlx::Error::PoolTimedOut),
+            PERSIST_ATTEMPTS,
+        );
+
+        let dump = dump();
+        for needle in [
+            "plays_persist_failed_total",
+            "spotify_auth_failed",
+            "spotify_cluster_update_age",
+        ] {
+            assert!(dump.contains(needle), "{needle} missing from export");
+        }
     }
 }

@@ -526,6 +526,10 @@ async fn repair_upgrades_relabels_and_retires_degraded_rows() {
     );
     assert_eq!(row_state(&pool, "gone").await.0, "unresolvable");
     assert!(db::degraded_tracks(&pool, 50).await.unwrap().is_empty());
+    assert_eq!(
+        db::degraded_counts(&pool).await.unwrap(),
+        [("cluster_map", 0), ("unresolvable", 1)]
+    );
 }
 
 /// Circuit breaker: when Spotify is down, a pass stops after three

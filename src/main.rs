@@ -67,7 +67,7 @@ async fn run_inner(cfg: Config) -> anyhow::Result<()> {
     match db::latest_play(&state.db).await {
         Ok(Some(event)) => state.hydrate(event).await,
         Ok(None) => {}
-        Err(e) => warn!("seeding now-playing from the database failed: {e}"),
+        Err(e) => warn!(error = %e, "seeding now-playing from the database failed"),
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -83,13 +83,13 @@ async fn run_inner(cfg: Config) -> anyhow::Result<()> {
         result = &mut spotify_task => {
             let _ = shutdown_tx.send(true);
             let inner = result.context("spotify task panicked")?;
-            error!("spotify task exited: {inner:?}");
+            error!(task = "spotify", error = ?inner, "task exited");
             anyhow::bail!("spotify task exited");
         }
         result = &mut server_task => {
             let _ = shutdown_tx.send(true);
             let inner = result.context("server task panicked")?;
-            error!("server task exited: {inner:?}");
+            error!(task = "server", error = ?inner, "task exited");
             anyhow::bail!("server task exited");
         }
     }
@@ -106,10 +106,16 @@ async fn run_inner(cfg: Config) -> anyhow::Result<()> {
     ] {
         match res {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => warn!("{name} task ended with error during shutdown: {e:#}"),
-            Ok(Err(join_err)) => warn!("{name} task panicked during shutdown: {join_err}"),
+            Ok(Ok(Err(e))) => warn!(
+                task = name,
+                error = %format!("{e:#}"),
+                "task ended with error during shutdown"
+            ),
+            Ok(Err(join_err)) => {
+                warn!(task = name, error = %join_err, "task panicked during shutdown")
+            }
             Err(_) => {
-                warn!("{name} task did not stop in time; aborting it");
+                warn!(task = name, "task did not stop in time; aborting it");
                 task.abort();
             }
         }

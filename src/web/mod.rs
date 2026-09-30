@@ -102,11 +102,17 @@ fn normalized_method(method: &Method) -> &'static str {
     }
 }
 
+/// Routes that get metrics but no trace: health probes hit them every few
+/// seconds and would bury the real traffic in identical traces.
+const UNTRACED_ROUTES: &[&str] = &["/healthz"];
+
 /// Router with CORS, request-span tracing and the duration middleware. The
 /// request span carries the matched route template plus the visitor address
 /// as forwarded by nginx (the socket peer is just the local proxy); per
 /// semconv, only 5xx responses mark the span as ERROR — 4xx is the client's
-/// problem, not a failed server span.
+/// problem, not a failed server span. [`UNTRACED_ROUTES`] get a disabled
+/// span (recording into it is a no-op) but still feed
+/// `http.server.request.duration`.
 pub fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_methods(Any)
@@ -119,6 +125,9 @@ pub fn router(state: AppState) -> Router {
                 .get::<MatchedPath>()
                 .map(|p| p.as_str())
                 .unwrap_or("unmatched");
+            if UNTRACED_ROUTES.contains(&route) {
+                return tracing::Span::none();
+            }
             let client = client_ip(
                 request.headers(),
                 request

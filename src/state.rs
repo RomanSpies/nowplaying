@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -39,6 +40,10 @@ pub struct AppState {
     /// Spotify rejected the stored credentials; the spotify task is parked
     /// until they change. Degrades /healthz to 503.
     pub spotify_auth_failed: Arc<AtomicBool>,
+    /// Local wall clock (Unix ms) of the last message on the dealer cluster
+    /// stream; 0 until the first one. Feeds `spotify_cluster_update_age`,
+    /// the only signal for a dealer that stays connected but falls silent.
+    pub last_cluster_update_ms: Arc<AtomicI64>,
     pub top_cache: Arc<TopCache>,
     pub ws_limits: Arc<WsLimits>,
 }
@@ -54,6 +59,7 @@ impl AppState {
             last_play: Arc::new(RwLock::new(None)),
             spotify_connected: Arc::new(AtomicBool::new(false)),
             spotify_auth_failed: Arc::new(AtomicBool::new(false)),
+            last_cluster_update_ms: Arc::new(AtomicI64::new(0)),
             top_cache: Arc::new(TopCache::default()),
             ws_limits,
         }
@@ -162,5 +168,39 @@ impl AppState {
 
     pub fn is_spotify_auth_failed(&self) -> bool {
         self.spotify_auth_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_cluster_update(&self) {
+        self.last_cluster_update_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    }
+
+    /// Time since the last cluster message; `None` before the first one.
+    pub fn cluster_update_age(&self) -> Option<Duration> {
+        cluster_update_age(
+            self.last_cluster_update_ms.load(Ordering::Relaxed),
+            Utc::now().timestamp_millis(),
+        )
+    }
+}
+
+/// Age of a `last_cluster_update_ms` reading; `None` for the 0 sentinel.
+pub(crate) fn cluster_update_age(last_ms: i64, now_ms: i64) -> Option<Duration> {
+    (last_ms > 0).then(|| Duration::from_millis(now_ms.saturating_sub(last_ms).max(0) as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cluster_update_age;
+    use std::time::Duration;
+
+    #[test]
+    fn cluster_update_age_is_absent_until_the_first_update_and_never_negative() {
+        assert_eq!(cluster_update_age(0, 5_000), None);
+        assert_eq!(
+            cluster_update_age(1_000, 5_000),
+            Some(Duration::from_millis(4_000))
+        );
+        assert_eq!(cluster_update_age(5_000, 1_000), Some(Duration::ZERO));
     }
 }

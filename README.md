@@ -50,8 +50,22 @@ das aktive Wiedergabegerät ist.
     Versuch) auf `play.persist`; `reconnect.attempt`/`connect.error_kind` auf
     `spotify.connect`; eigene Spans `spotify.auth_parked`, `metadata.repair`
     (+ `metadata.repair_track`) und `api.top` (`cache=hit|miss|refresh`);
-    `ws.session` endet mit `close.reason`, `messages.sent`,
-    `session.duration_s`. Pool-Sättigung via
+    WS-Sessions haben bewusst keinen eigenen Span (Stunden-Spans gehen bei
+    einem Crash verloren und verzerren Dauer-Auswertungen): der Upgrade-Trace
+    bekommt ein kurzes Kind `ws.session.start` (Subscribe + Replay), alle
+    Session-Logs tragen `ws.session_id` + `client.address`, das Disconnect-Log
+    `close.reason`, `messages.sent`, `session.duration_s`. `/healthz` wird
+    nicht getraced (Probe-Rauschen), bekommt aber weiter Metriken.
+  - Alarm-Metriken: `spotify_auth_failed` (1 = geparkt, braucht `--login`),
+    `plays_persist_failed_total` (endgültig verlorene Plays; `db_errors_total`
+    zählt dagegen jeden Versuch), `spotify_cluster_update_age` (Sekunden seit
+    der letzten Dealer-Nachricht — Stille ist auch normal, wenn nichts
+    läuft), `plays_degraded{metadata_source}` (Reparatur-Backlog, nach jedem
+    Lauf aktualisiert). `metadata_fetch_duration` misst nur noch den
+    Track/Episode-Abruf (`outcome=ok|error|timeout`), Lyrics separat in
+    `lyrics_fetch_duration`.
+  - Logs: Fehler stehen immer im strukturierten Feld `error`, Messages sind
+    konstant (gruppierbar in Loki). Pool-Sättigung via
     `db.client.connection.count` {state=used|idle} und
     `db.client.connection.max` (semconv); vom Replay-Guard geschluckte Plays
     via `plays_replay_suppressed_total`. DB-Latenz je Operation als
